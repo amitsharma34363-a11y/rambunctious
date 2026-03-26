@@ -143,12 +143,25 @@ def build_surplus_prediction(
     historical_entries,
     baseline_prediction=None,
     baseline_confidence=None,
+    provider_type="restaurant",
 ):
+    provider_type = str(provider_type or "restaurant").strip().lower()
+    provider_multipliers = {
+        "restaurant": 1.0,
+        "hotel": 0.92,
+        "banquet": 1.18,
+    }
     food_prepared_value = max(0.0, float(food_prepared or 0))
     food_sold_value = max(0.0, float(food_sold or 0))
+    base_prediction = (
+        baseline_prediction
+        if baseline_prediction is not None
+        else estimate_surplus(food_prepared_value, food_sold_value, weather_score, day_of_week, hour)
+        * provider_multipliers.get(provider_type, 1.0)
+    )
     prediction = max(
         0,
-        round(baseline_prediction if baseline_prediction is not None else estimate_surplus(food_prepared_value, food_sold_value, weather_score, day_of_week, hour)),
+        round(base_prediction),
     )
     confidence = clamp(
         round(baseline_confidence if baseline_confidence is not None else (62 + (min(len(historical_entries), 10) * 3))),
@@ -166,10 +179,17 @@ def build_surplus_prediction(
         "Create an NGO alert 45-60 minutes before closing." if prediction > 12 else "No urgent rescue alert is needed yet.",
         "Bundle similar categories together to speed pickup." if remaining_now > 15 else "Keep categories separated for quick pickup.",
     ]
+    if provider_type == "hotel":
+        suggestions[0] = "Use buffet trend tracking to keep hotel surplus steady."
+        suggestions[2] = "Enable recurring rescue alerts for consistent nightly pickups."
+    elif provider_type == "banquet":
+        suggestions[0] = "Use event guest counts to forecast banquet surplus spikes."
+        suggestions[1] = "Schedule NGO pickup windows after the event closes."
+        suggestions[2] = "Offer bulk pickups with a minimum lot size for faster clearance."
     fallback = {
         "predicted_surplus": prediction,
         "confidence": confidence,
-        "message": f"Expected closing surplus is about {prediction} meals.",
+        "message": f"Expected {provider_type} closing surplus is about {prediction} meals.",
         "suggestions": suggestions,
     }
     history_snapshot = [
@@ -184,7 +204,7 @@ def build_surplus_prediction(
     ]
     response, meta = ollama_service.generate_json(
         (
-            "You are helping a food rescue platform forecast leftover meals. "
+            "You are helping a food rescue platform forecast leftover meals across restaurants, hotels, and banquets. "
             "Return only JSON with keys predicted_surplus, confidence, message, and suggestions. "
             "predicted_surplus must be a non-negative integer. confidence must be 1-99. "
             "Keep predicted_surplus operationally realistic for the input. "
@@ -194,6 +214,7 @@ def build_surplus_prediction(
         {
             "current_input": {
                 "day_of_week": int(day_of_week),
+                "provider_type": provider_type,
                 "food_prepared": food_prepared_value,
                 "food_sold": food_sold_value,
                 "weather_score": float(weather_score or 0.7),
@@ -316,7 +337,7 @@ def build_prediction_accuracy(ollama_service, weekly_snapshot):
     }
 
 
-def build_ngo_recommendations(ollama_service, restaurant_location, surplus_meals, food_categories, ngos, order_counts):
+def build_ngo_recommendations(ollama_service, restaurant_location, surplus_meals, food_categories, provider_type, ngos, order_counts):
     fallback_recommendations = []
     for ngo in ngos:
         distance = (sum(ord(ch) for ch in ngo.get("email", "")) % 9) + 1
@@ -348,6 +369,7 @@ def build_ngo_recommendations(ollama_service, restaurant_location, surplus_meals
             "restaurant_location": restaurant_location,
             "surplus_meals": int(surplus_meals),
             "food_categories": food_categories,
+            "provider_type": str(provider_type or "restaurant"),
             "ngos": [
                 {
                     "ngo_name": ngo.get("name", ngo.get("email", "NGO")),
@@ -405,7 +427,7 @@ def build_smart_matches(ollama_service, active_alerts, active_ngos, order_counts
                 best_match = {
                     "restaurant": alert.get("restaurant_name", "Restaurant"),
                     "bestNgo": ngo.get("name", ngo.get("email", "NGO")),
-                    "reason": " + ".join(reasons),
+                    "reason": f"{alert.get('provider_label', 'Provider')}: " + " + ".join(reasons),
                     "score": score,
                 }
                 best_score = score
@@ -434,9 +456,12 @@ def build_smart_matches(ollama_service, active_alerts, active_ngos, order_counts
             "alerts": [
                 {
                     "restaurant": alert.get("restaurant_name", "Restaurant"),
+                    "provider_type": alert.get("provider_type", "restaurant"),
+                    "provider_label": alert.get("provider_label", "Restaurant"),
                     "location": alert.get("location", "Unknown"),
                     "surplus_meals": int(alert.get("surplus_meals", 0)),
                     "food_type": alert.get("food_type", "Mixed"),
+                    "minimum_pickup": int(alert.get("minimum_pickup", 1) or 1),
                 }
                 for alert in active_alerts
             ],

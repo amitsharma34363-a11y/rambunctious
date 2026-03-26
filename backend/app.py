@@ -77,12 +77,32 @@ mock_users = [
         'email': 'restaurant@demo.com',
         'password': bcrypt.hashpw('password123'.encode('utf-8'), bcrypt.gensalt()),
         'role': 'restaurant',
-        'subscription': 'premium',
+        'subscription': 'restaurant_pro',
         'createdAt': datetime.now(),
         'loginHistory': []
     },
     {
         '_id': '2',
+        'name': 'Demo Hotel',
+        'email': 'hotel@demo.com',
+        'password': bcrypt.hashpw('password123'.encode('utf-8'), bcrypt.gensalt()),
+        'role': 'hotel',
+        'subscription': 'hotel_pro',
+        'createdAt': datetime.now(),
+        'loginHistory': []
+    },
+    {
+        '_id': '3',
+        'name': 'Demo Banquet',
+        'email': 'banquet@demo.com',
+        'password': bcrypt.hashpw('password123'.encode('utf-8'), bcrypt.gensalt()),
+        'role': 'banquet',
+        'subscription': 'banquet_pro',
+        'createdAt': datetime.now(),
+        'loginHistory': []
+    },
+    {
+        '_id': '4',
         'name': 'Demo NGO',
         'email': 'ngo@demo.com',
         'password': bcrypt.hashpw('password123'.encode('utf-8'), bcrypt.gensalt()),
@@ -92,7 +112,7 @@ mock_users = [
         'loginHistory': []
     },
     {
-        '_id': '3',
+        '_id': '5',
         'name': 'Admin',
         'email': 'admin@demo.com',
         'password': bcrypt.hashpw('password123'.encode('utf-8'), bcrypt.gensalt()),
@@ -109,6 +129,90 @@ mock_food_data = []
 mock_orders = []
 mock_subscriptions = []
 DAY_LABELS = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+PROVIDER_ROLES = ("restaurant", "hotel", "banquet")
+PUBLIC_ROLES = PROVIDER_ROLES + ("ngo",)
+ALL_ROLES = PUBLIC_ROLES + ("admin",)
+PROVIDER_ROLE_CONFIG = {
+    "restaurant": {
+        "label": "Restaurant",
+        "price_per_portion": 20,
+        "subscription_plan": "restaurant_pro",
+        "subscription_price": 199,
+        "minimum_pickup": 1,
+        "closing_time": "22:00",
+        "available_after": "21:30",
+        "daily_surplus_auto_entry": False,
+        "recurring_alerts": False,
+    },
+    "hotel": {
+        "label": "Hotel",
+        "price_per_portion": 15,
+        "subscription_plan": "hotel_pro",
+        "subscription_price": 499,
+        "minimum_pickup": 1,
+        "closing_time": "23:00",
+        "available_after": "22:00",
+        "daily_surplus_auto_entry": True,
+        "recurring_alerts": True,
+    },
+    "banquet": {
+        "label": "Banquet",
+        "price_per_portion": 10,
+        "subscription_plan": "banquet_pro",
+        "subscription_price": 999,
+        "minimum_pickup": 20,
+        "closing_time": "23:30",
+        "available_after": "22:00",
+        "daily_surplus_auto_entry": False,
+        "recurring_alerts": False,
+    },
+}
+PROVIDER_DISTRIBUTION_COLORS = {
+    "restaurant": "#f3ad2d",
+    "hotel": "#2f9d61",
+    "banquet": "#1f6f78",
+}
+PLATFORM_EXPANSION_MESSAGE = (
+    "We expanded beyond restaurants to include hotels and banquet halls, "
+    "enabling large-scale food redistribution with dynamic pricing and AI-driven predictions."
+)
+DEMO_USER_FIXTURES = {
+    "restaurant@demo.com": {
+        "name": "Demo Restaurant",
+        "role": "restaurant",
+        "subscription": "restaurant_pro",
+        "location": "Demo Location",
+        "phone": "+917004228038",
+    },
+    "hotel@demo.com": {
+        "name": "Demo Hotel",
+        "role": "hotel",
+        "subscription": "hotel_pro",
+        "location": "Demo Location",
+        "phone": "+917004228039",
+    },
+    "banquet@demo.com": {
+        "name": "Demo Banquet",
+        "role": "banquet",
+        "subscription": "banquet_pro",
+        "location": "Demo Location",
+        "phone": "+917004228040",
+    },
+    "ngo@demo.com": {
+        "name": "Demo NGO",
+        "role": "ngo",
+        "subscription": "premium",
+        "location": "Demo Location",
+        "phone": "+917004228037",
+    },
+    "admin@demo.com": {
+        "name": "Admin",
+        "role": "admin",
+        "subscription": "premium",
+        "location": "HQ",
+        "phone": "",
+    },
+}
 
 def matches_query(item, query):
     for key, expected in query.items():
@@ -286,21 +390,166 @@ def role_required(*allowed_roles):
         return wrapper
     return decorator
 
-def get_or_create_restaurant_profile(email, user=None):
-    restaurant = restaurants_col.find_one({"email": email})
-    if restaurant:
-        return restaurant
+def safe_float(value, default=0.0):
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return float(default)
 
-    user = user or users_col.find_one({"email": email}) or {}
-    restaurant = {
-        "email": email,
-        "name": user.get("name", email.split("@")[0]),
-        "location": user.get("location", "Unknown"),
-        "phone": user.get("phone", ""),
-        "closing_time": user.get("closing_time", "22:00")
+
+def safe_int(value, default=0):
+    try:
+        return int(round(float(value)))
+    except (TypeError, ValueError):
+        return int(default)
+
+
+def coerce_bool(value, default=False):
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"true", "1", "yes", "on"}:
+            return True
+        if normalized in {"false", "0", "no", "off"}:
+            return False
+    return bool(value)
+
+
+def is_provider_role(role):
+    return role in PROVIDER_ROLES
+
+
+def get_provider_type(value):
+    if isinstance(value, dict):
+        role = value.get("provider_type") or value.get("role")
+    else:
+        role = value
+    return role if role in PROVIDER_ROLES else "restaurant"
+
+
+def get_provider_config(role):
+    return PROVIDER_ROLE_CONFIG.get(get_provider_type(role), PROVIDER_ROLE_CONFIG["restaurant"])
+
+
+def get_provider_label(role):
+    return get_provider_config(role)["label"]
+
+
+def get_provider_subscription_plan_id(role):
+    return get_provider_config(role)["subscription_plan"]
+
+
+def build_provider_subscription_plan(role):
+    config = get_provider_config(role)
+    provider_type = get_provider_type(role)
+    return {
+        "id": config["subscription_plan"],
+        "name": f"{config['label']} Pro",
+        "provider_type": provider_type,
+        "price": config["subscription_price"],
+        "price_per_portion": config["price_per_portion"],
+        "minimum_pickup": config["minimum_pickup"],
+        "features": [
+            f"Dynamic pricing at Rs {config['price_per_portion']} per portion",
+            "AI-driven surplus prediction",
+            "Real-time NGO matching",
+            "Advanced provider analytics",
+            "Priority rescue support",
+        ],
+        "limitations": {
+            "daily_requests": -1,
+            "ai_predictions": True,
+            "priority_matching": True,
+        },
     }
-    restaurants_col.insert_one(restaurant)
-    return restaurant
+
+
+def build_provider_profile(email, user=None, payload=None):
+    payload = payload or {}
+    user = user or users_col.find_one({"email": email}) or {}
+    role = get_provider_type(payload.get("provider_type") or payload.get("role") or user.get("role"))
+    config = get_provider_config(role)
+    closing_time = payload.get("closing_time") or user.get("closing_time") or config["closing_time"]
+    return {
+        "email": email,
+        "name": payload.get("name") or user.get("name", email.split("@")[0]),
+        "role": role,
+        "provider_type": role,
+        "provider_label": config["label"],
+        "location": payload.get("location") or user.get("location", "Unknown"),
+        "phone": payload.get("phone") or user.get("phone", ""),
+        "closing_time": closing_time,
+        "available_after": payload.get("available_after") or user.get("available_after") or config["available_after"] or closing_time,
+        "price_per_portion": safe_float(
+            payload.get("price_per_portion", payload.get("price")),
+            user.get("price_per_portion", config["price_per_portion"]),
+        ),
+        "minimum_pickup": max(
+            1,
+            safe_int(payload.get("minimum_pickup"), user.get("minimum_pickup", config["minimum_pickup"])),
+        ),
+        "daily_surplus_auto_entry": coerce_bool(
+            payload.get("daily_surplus_auto_entry"),
+            user.get("daily_surplus_auto_entry", config["daily_surplus_auto_entry"]),
+        ),
+        "recurring_alerts": coerce_bool(
+            payload.get("recurring_alerts"),
+            user.get("recurring_alerts", config["recurring_alerts"]),
+        ),
+        "event_name": payload.get("event_name") or user.get("event_name", ""),
+        "guest_count": max(0, safe_int(payload.get("guest_count"), user.get("guest_count", 0))),
+        "expected_surplus": max(
+            0,
+            safe_int(payload.get("expected_surplus"), user.get("expected_surplus", 0)),
+        ),
+    }
+
+
+def get_or_create_provider_profile(email, user=None):
+    provider = restaurants_col.find_one({"email": email})
+    expected_profile = build_provider_profile(email, user=user)
+    if provider:
+        updates = {}
+        for key, value in expected_profile.items():
+            if provider.get(key) in (None, ""):
+                updates[key] = value
+        if updates:
+            restaurants_col.update_one({"email": email}, {"$set": updates})
+            provider = {**provider, **updates}
+        return provider
+
+    restaurants_col.insert_one(expected_profile)
+    return expected_profile
+
+
+def update_provider_profile(email, payload=None):
+    payload = payload or {}
+    current_user = users_col.find_one({"email": email}) or {}
+    current_profile = get_or_create_provider_profile(email, current_user)
+    next_profile = {**current_profile, **build_provider_profile(email, user=current_user, payload=payload)}
+    restaurants_col.update_one({"email": email}, {"$set": next_profile})
+    users_col.update_one(
+        {"email": email},
+        {"$set": {
+            "price_per_portion": next_profile["price_per_portion"],
+            "minimum_pickup": next_profile["minimum_pickup"],
+            "available_after": next_profile["available_after"],
+            "daily_surplus_auto_entry": next_profile["daily_surplus_auto_entry"],
+            "recurring_alerts": next_profile["recurring_alerts"],
+            "event_name": next_profile["event_name"],
+            "guest_count": next_profile["guest_count"],
+            "expected_surplus": next_profile["expected_surplus"],
+            "closing_time": next_profile["closing_time"],
+        }},
+    )
+    return restaurants_col.find_one({"email": email}) or next_profile
+
+
+def get_or_create_restaurant_profile(email, user=None):
+    return get_or_create_provider_profile(email, user=user)
 
 def get_or_create_ngo_profile(email, user=None):
     ngo = ngos_col.find_one({"email": email})
@@ -560,6 +809,92 @@ def build_order_counts():
     return counts
 
 
+def build_provider_distribution():
+    totals = {role: 0.0 for role in PROVIDER_ROLES}
+
+    for order in orders_col.find():
+        provider_type = get_provider_type(order)
+        totals[provider_type] += safe_float(order.get("total_portions", 0))
+
+    if sum(totals.values()) <= 0:
+        for alert in alerts_col.find():
+            provider_type = get_provider_type(alert)
+            totals[provider_type] += safe_float(alert.get("surplus_meals", 0))
+
+    if sum(totals.values()) <= 0:
+        totals = {"restaurant": 40.0, "hotel": 35.0, "banquet": 25.0}
+
+    total_volume = sum(totals.values()) or 1.0
+    return [
+        {
+            "key": role,
+            "label": get_provider_label(role),
+            "value": round(totals[role], 1),
+            "percent": round((totals[role] / total_volume) * 100, 1),
+            "color": PROVIDER_DISTRIBUTION_COLORS[role],
+        }
+        for role in PROVIDER_ROLES
+    ]
+
+
+def build_provider_insights():
+    stats = {
+        role: {
+            "entries": 0,
+            "surplus_total": 0.0,
+            "weekend_surplus": 0.0,
+            "weekday_surplus": 0.0,
+            "samples": [],
+        }
+        for role in PROVIDER_ROLES
+    }
+
+    for entry in food_data_col.find():
+        provider_type = get_provider_type(entry)
+        remaining = safe_float(entry.get("remaining_food", 0))
+        entry_dt = parse_entry_datetime(entry.get("timestamp")) or parse_entry_datetime(entry.get("date"))
+        is_weekend = bool(entry_dt and entry_dt.weekday() >= 5)
+        stats[provider_type]["entries"] += 1
+        stats[provider_type]["surplus_total"] += remaining
+        stats[provider_type]["samples"].append(remaining)
+        if is_weekend:
+            stats[provider_type]["weekend_surplus"] += remaining
+        else:
+            stats[provider_type]["weekday_surplus"] += remaining
+
+    banquet_stats = stats["banquet"]
+    hotel_stats = stats["hotel"]
+    distribution = build_provider_distribution()
+    leading_provider = max(distribution, key=lambda item: item["value"])
+    hotel_average = (
+        sum(hotel_stats["samples"]) / len(hotel_stats["samples"])
+        if hotel_stats["samples"]
+        else 0.0
+    )
+    hotel_spread = (
+        max(hotel_stats["samples"]) - min(hotel_stats["samples"])
+        if len(hotel_stats["samples"]) > 1
+        else 0.0
+    )
+
+    banquet_message = (
+        "Banquets generate highest surplus on weekends."
+        if banquet_stats["entries"] == 0 or banquet_stats["weekend_surplus"] >= banquet_stats["weekday_surplus"]
+        else "Banquet surplus is currently spreading more evenly across weekdays."
+    )
+    hotel_message = (
+        "Hotels are most consistent donors."
+        if hotel_stats["entries"] == 0 or hotel_spread <= max(10.0, hotel_average * 0.35)
+        else "Hotels are steadily contributing surplus."
+    )
+
+    return [
+        banquet_message,
+        hotel_message,
+        f"{leading_provider['label']} providers currently contribute {leading_provider['percent']}% of tracked rescue volume.",
+    ]
+
+
 def build_weekly_prediction_snapshot():
     day_labels = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
     grouped = {i: {"prepared": [], "remaining": []} for i in range(7)}
@@ -591,7 +926,7 @@ def build_weekly_prediction_snapshot():
     return snapshot
 
 
-def predict_with_trained_surplus_model(day_of_week, food_prepared, food_sold, hour, month=None):
+def predict_with_trained_surplus_model(day_of_week, food_prepared, food_sold, hour, month=None, provider_type="restaurant"):
     if trained_surplus_model is None:
         return None
 
@@ -606,10 +941,20 @@ def predict_with_trained_surplus_model(day_of_week, food_prepared, food_sold, ho
         "food_prepared": float(food_prepared),
     }
     prediction = trained_surplus_model.predict(payload)
+    provider_type = get_provider_type(provider_type)
+    multiplier = 1.0
+    if provider_type == "hotel":
+        multiplier = 0.9 if effective_day < 5 else 0.96
+    elif provider_type == "banquet":
+        multiplier = 1.32 if effective_day >= 5 else 1.12
+    prediction *= multiplier
     return {
         "prediction": prediction,
         "confidence": 96 if trained_surplus_model else 62,
-        "metadata": trained_surplus_model.metadata(),
+        "metadata": {
+            **trained_surplus_model.metadata(),
+            "provider_type": provider_type,
+        },
     }
 
 
@@ -620,61 +965,75 @@ def predict_with_trained_surplus_model(day_of_week, food_prepared, food_sold, ho
 # -------------------------
 @app.route("/api/login", methods=["POST"])
 def login():
-    data = request.json
+    data = request.json or {}
     email = data.get("email")
     password = data.get("password")
     role = data.get("role")
     
     if not all([email, password, role]):
         return jsonify({"error": "Email, password, and role are required"}), 400
+    if role not in ALL_ROLES:
+        return jsonify({"error": "Invalid role selected"}), 400
     
     # Find user
     user = users_col.find_one({"email": email})
     
     if not user:
         # Auto-create demo users for testing
-        if email in ["restaurant@demo.com", "ngo@demo.com", "admin@demo.com"] and password == "password123":
+        demo_user = DEMO_USER_FIXTURES.get(email)
+        if demo_user and password == "password123":
+            if demo_user["role"] != role:
+                return jsonify({"error": "Invalid role selection"}), 403
+
             hashed_password = bcrypt.hashpw(password.encode("utf-8"), bcrypt.gensalt())
             user_data = {
                 "email": email,
                 "password": hashed_password,
                 "role": role,
-                "name": role.title(),
-                "subscription": "premium",
+                "name": demo_user["name"],
+                "subscription": demo_user.get("subscription", "free"),
+                "location": demo_user.get("location", "Demo Location"),
+                "phone": demo_user.get("phone", ""),
                 "createdAt": datetime.utcnow(),
                 "loginHistory": []
             }
+            if is_provider_role(role):
+                provider_profile = build_provider_profile(email, user=user_data)
+                user_data.update({
+                    "price_per_portion": provider_profile["price_per_portion"],
+                    "minimum_pickup": provider_profile["minimum_pickup"],
+                    "available_after": provider_profile["available_after"],
+                    "daily_surplus_auto_entry": provider_profile["daily_surplus_auto_entry"],
+                    "recurring_alerts": provider_profile["recurring_alerts"],
+                    "event_name": provider_profile["event_name"],
+                    "guest_count": provider_profile["guest_count"],
+                    "expected_surplus": provider_profile["expected_surplus"],
+                    "closing_time": provider_profile["closing_time"],
+                })
             users_col.insert_one(user_data)
             
             # Create profile
-            if role == "restaurant":
-                restaurants_col.insert_one({
-                    "email": email,
-                    "name": "Demo Restaurant",
-                    "location": "Demo Location",
-                    "phone": "+917004228038",
-                    "closing_time": "22:00"
-                })
+            if is_provider_role(role):
+                get_or_create_provider_profile(email, user_data)
             elif role == "ngo":
-                ngos_col.insert_one({
-                    "email": email,
-                    "name": "Demo NGO",
-                    "location": "Demo Location",
-                    "phone": "+917004228037",
-                    "active": True
-                })
+                get_or_create_ngo_profile(email, user_data)
             
             access_token = create_access_token(
                 identity=email,
-                additional_claims={"role": role, "name": role.title()}
+                additional_claims={
+                    "role": role,
+                    "name": demo_user["name"],
+                    "subscription": user_data.get("subscription", "free"),
+                }
             )
             
             return jsonify({
                 "message": "Demo account created & logged in",
                 "token": access_token,
                 "role": role,
-                "name": role.title(),
-                "subscription": "premium"
+                "name": demo_user["name"],
+                "subscription": user_data.get("subscription", "free"),
+                "provider_type": role if is_provider_role(role) else None,
             }), 200
         
         return jsonify({"error": "User not found"}), 404
@@ -686,6 +1045,11 @@ def login():
     # Verify role matches
     if user["role"] != role:
         return jsonify({"error": "Invalid role selection"}), 403
+
+    if is_provider_role(role):
+        get_or_create_provider_profile(email, user)
+    elif role == "ngo":
+        get_or_create_ngo_profile(email, user)
     
     # Update login history
     users_col.update_one(
@@ -704,7 +1068,8 @@ def login():
         "token": access_token,
         "role": role,
         "name": user["name"],
-        "subscription": user.get("subscription", "free")
+        "subscription": user.get("subscription", "free"),
+        "provider_type": role if is_provider_role(role) else None,
     }), 200
 
 
@@ -713,7 +1078,7 @@ def login():
 # -------------------------
 @app.route("/api/register", methods=["POST"])
 def register():
-    data = request.json
+    data = request.json or {}
     email = data.get("email")
     password = data.get("password")
     role = data.get("role")
@@ -723,6 +1088,8 @@ def register():
     
     if not all([email, password, role, name]):
         return jsonify({"error": "All fields are required"}), 400
+    if role not in PUBLIC_ROLES:
+        return jsonify({"error": "Invalid role selected"}), 400
     
     # Check if user exists
     if users_col.find_one({"email": email}):
@@ -743,35 +1110,36 @@ def register():
         "createdAt": datetime.utcnow(),
         "loginHistory": []
     }
+    if is_provider_role(role):
+        provider_profile = build_provider_profile(email, user=user, payload=data)
+        user.update({
+            "price_per_portion": provider_profile["price_per_portion"],
+            "minimum_pickup": provider_profile["minimum_pickup"],
+            "available_after": provider_profile["available_after"],
+            "daily_surplus_auto_entry": provider_profile["daily_surplus_auto_entry"],
+            "recurring_alerts": provider_profile["recurring_alerts"],
+            "event_name": provider_profile["event_name"],
+            "guest_count": provider_profile["guest_count"],
+            "expected_surplus": provider_profile["expected_surplus"],
+            "closing_time": provider_profile["closing_time"],
+        })
     
     users_col.insert_one(user)
     
     # Create profile based on role
-    if role == "restaurant":
-        restaurants_col.insert_one({
-            "email": email,
-            "name": name,
-            "location": location,
-            "phone": phone,
-            "closing_time": "22:00"
-        })
+    if is_provider_role(role):
+        get_or_create_provider_profile(email, user)
     elif role == "ngo":
-        ngos_col.insert_one({
-            "email": email,
-            "name": name,
-            "location": location,
-            "phone": phone,
-            "active": True
-        })
+        get_or_create_ngo_profile(email, user)
     
     return jsonify({"message": "Registration successful! Please login."}), 201
 
 @app.route("/api/restaurant/dashboard", methods=["GET"])
-@role_required("restaurant")
+@role_required(*PROVIDER_ROLES)
 def restaurant_dashboard():
     current_user = get_jwt_identity()
     
-    restaurant = get_or_create_restaurant_profile(current_user)
+    restaurant = get_or_create_provider_profile(current_user)
     food_history = list(
         food_data_col.find({"restaurant_email": current_user}).sort("timestamp", -1).limit(20)
     )
@@ -780,30 +1148,38 @@ def restaurant_dashboard():
     
     return jsonify({
         "restaurant": serialize_document(restaurant),
+        "provider": serialize_document(restaurant),
         "food_data": serialize_document(latest_food_data),
         "food_history": [serialize_document(entry) for entry in food_history],
         "chart_data": chart_data
     }), 200
 
 @app.route("/api/restaurant/food-data", methods=["POST"])
-@role_required("restaurant")
+@role_required(*PROVIDER_ROLES)
 def submit_food_data():
     current_user = get_jwt_identity()
-    data = request.json
+    data = request.json or {}
+    provider = update_provider_profile(current_user, data)
+    provider_type = get_provider_type(provider)
     
     food_prepared = float(data.get("food_prepared", 0))
     food_sold = float(data.get("food_sold", 0))
     food_type = data.get("food_type", "Both")
     category = data.get("category", "Mixed")
-    closing_time = data.get("closing_time", "22:00")
-    price = float(data.get("price", 20))
-    discount_price = float(data.get("discount_price", 20))
+    closing_time = data.get("closing_time", provider.get("closing_time", "22:00"))
+    price = safe_float(data.get("price_per_portion", data.get("price")), provider.get("price_per_portion", 20))
+    discount_price = safe_float(data.get("discount_price", price), price)
     
     remaining_food = calculate_surplus(food_prepared, food_sold)
     
     # Save food data
     food_entry = {
         "restaurant_email": current_user,
+        "provider_email": current_user,
+        "restaurant_name": provider.get("name", "Provider"),
+        "provider_name": provider.get("name", "Provider"),
+        "provider_type": provider_type,
+        "provider_label": provider.get("provider_label", get_provider_label(provider_type)),
         "date": datetime.now().date(),
         "timestamp": datetime.utcnow(),
         "food_prepared": food_prepared,
@@ -814,7 +1190,24 @@ def submit_food_data():
         "category": category,
         "closing_time": closing_time,
         "price": price,
-        "discount_price": discount_price
+        "price_per_portion": price,
+        "discount_price": discount_price,
+        "available_after": data.get("available_after", provider.get("available_after", closing_time)),
+        "minimum_pickup": max(1, safe_int(data.get("minimum_pickup"), provider.get("minimum_pickup", 1))),
+        "event_name": data.get("event_name", provider.get("event_name", "")),
+        "guest_count": max(0, safe_int(data.get("guest_count"), provider.get("guest_count", 0))),
+        "expected_surplus": max(
+            0,
+            safe_int(data.get("expected_surplus"), provider.get("expected_surplus", remaining_food)),
+        ),
+        "daily_surplus_auto_entry": coerce_bool(
+            data.get("daily_surplus_auto_entry"),
+            provider.get("daily_surplus_auto_entry", False),
+        ),
+        "recurring_alerts": coerce_bool(
+            data.get("recurring_alerts"),
+            provider.get("recurring_alerts", False),
+        ),
     }
     
     food_data_col.insert_one(food_entry)
@@ -825,6 +1218,7 @@ def submit_food_data():
         food_sold=food_sold,
         hour=datetime.now().hour,
         month=datetime.now().month,
+        provider_type=provider_type,
     )
     ai_result = build_surplus_prediction(
         ollama_service=ollama_service,
@@ -836,10 +1230,12 @@ def submit_food_data():
         historical_entries=list(food_data_col.find({"restaurant_email": current_user})),
         baseline_prediction=trained_result["prediction"] if trained_result else None,
         baseline_confidence=trained_result["confidence"] if trained_result else None,
+        provider_type=provider_type,
     )
     
     return jsonify({
         "message": "Food data submitted successfully",
+        "provider_type": provider_type,
         "remaining_food": remaining_food,
         "ai_prediction": ai_result["predicted_surplus"],
         "ai_confidence": ai_result["confidence"],
@@ -852,13 +1248,14 @@ def submit_food_data():
     }), 201
 
 @app.route("/api/restaurant/send-alert", methods=["POST"])
-@role_required("restaurant")
+@role_required(*PROVIDER_ROLES)
 def send_rescue_alert():
     current_user = get_jwt_identity()
-    data = request.json
+    data = request.json or {}
     
     # Find or create restaurant profile
-    restaurant = get_or_create_restaurant_profile(current_user)
+    restaurant = update_provider_profile(current_user, data)
+    provider_type = get_provider_type(restaurant)
     
     surplus_meals = int(data.get("surplus_meals", 0))
     
@@ -877,11 +1274,29 @@ def send_rescue_alert():
         food_data_col.find({"restaurant_email": current_user}).sort("timestamp", -1).limit(1)
     )
     linked_food_entry = latest_food_entries[0] if latest_food_entries else None
+    price_per_portion = safe_float(
+        data.get("price_per_portion", data.get("price")),
+        restaurant.get("price_per_portion", get_provider_config(provider_type)["price_per_portion"]),
+    )
+    available_after = (
+        data.get("available_after")
+        or restaurant.get("available_after")
+        or data.get("pickup_time")
+        or restaurant.get("closing_time", "21:30")
+    )
+    minimum_pickup = max(
+        1,
+        safe_int(data.get("minimum_pickup"), restaurant.get("minimum_pickup", get_provider_config(provider_type)["minimum_pickup"])),
+    )
     
     # Create alert for NGOs
     alert = {
         "restaurant_email": current_user,
         "restaurant_name": restaurant.get("name", "Restaurant"),
+        "provider_email": current_user,
+        "provider_name": restaurant.get("name", "Provider"),
+        "provider_type": provider_type,
+        "provider_label": restaurant.get("provider_label", get_provider_label(provider_type)),
         "location": restaurant.get("location", "Unknown"),
         "phone": restaurant.get("phone", ""),
         "food_entry_id": linked_food_entry.get("_id") if linked_food_entry else None,
@@ -890,8 +1305,25 @@ def send_rescue_alert():
         "category": data.get("category", "Mixed"),
         "categories": categories,
         "items": items,
-        "price": float(data.get("price", 20)),
-        "pickup_time": data.get("pickup_time", "21:30"),
+        "price": price_per_portion,
+        "price_per_portion": price_per_portion,
+        "pickup_time": data.get("pickup_time", available_after),
+        "available_after": available_after,
+        "minimum_pickup": minimum_pickup,
+        "event_name": data.get("event_name", restaurant.get("event_name", "")),
+        "guest_count": max(0, safe_int(data.get("guest_count"), restaurant.get("guest_count", 0))),
+        "expected_surplus": max(
+            0,
+            safe_int(data.get("expected_surplus"), restaurant.get("expected_surplus", remaining_portions)),
+        ),
+        "daily_surplus_auto_entry": coerce_bool(
+            data.get("daily_surplus_auto_entry"),
+            restaurant.get("daily_surplus_auto_entry", False),
+        ),
+        "recurring_alerts": coerce_bool(
+            data.get("recurring_alerts"),
+            restaurant.get("recurring_alerts", False),
+        ),
         "status": "pending",
         "created_at": datetime.utcnow(),
         "expires_at": datetime.utcnow() + timedelta(hours=2)
@@ -907,8 +1339,8 @@ def send_rescue_alert():
                 if "phone" in ngo:
                     message = client.messages.create(
                         body=(
-                            f"Food Rescue Alert\n{restaurant['name']} has {surplus_meals} meals available."
-                            f"\nPickup by: {data.get('pickup_time', '21:30')}\nReply YES to accept."
+                            f"Food Rescue Alert\n{restaurant['name']} ({get_provider_label(provider_type)}) has {surplus_meals} meals available."
+                            f"\nPickup by: {data.get('pickup_time', available_after)}\nReply YES to accept."
                         ),
                         from_=TWILIO_NUMBER,
                         to=ngo["phone"]
@@ -1013,7 +1445,13 @@ def accept_alert(alert_id):
         return jsonify({"error": "Select at least one category portion"}), 400
 
     remaining_portions = get_alert_remaining_portions(updated_categories)
-    next_status = "pending" if remaining_portions > 0 else "accepted"
+    minimum_pickup = max(1, safe_int(alert.get("minimum_pickup", 1), 1))
+    if total_portions < minimum_pickup:
+        return jsonify({"error": f"Minimum pickup is {minimum_pickup} portions for this provider"}), 400
+
+    next_status = "partially_reserved" if remaining_portions > 0 else "accepted"
+    provider_type = get_provider_type(alert)
+    unit_price = safe_float(alert.get("price_per_portion", alert.get("price", 0)), 0)
 
     alerts_col.update_one(
         {"_id": alert_id},
@@ -1031,11 +1469,16 @@ def accept_alert(alert_id):
         "ngo_email": current_user,
         "restaurant_email": alert["restaurant_email"],
         "restaurant_name": alert.get("restaurant_name", "Restaurant"),
+        "provider_email": alert.get("provider_email", alert["restaurant_email"]),
+        "provider_name": alert.get("provider_name", alert.get("restaurant_name", "Restaurant")),
+        "provider_type": provider_type,
+        "provider_label": alert.get("provider_label", get_provider_label(provider_type)),
         "alert_id": alert_id,
         "items": selected_items,
         "items_summary": summarize_order_items(selected_items),
         "total_portions": total_portions,
-        "total_price": float(alert.get("price", 0)) * total_portions,
+        "unit_price": unit_price,
+        "total_price": unit_price * total_portions,
         "pickup_time": data.get("pickup_time", alert.get("pickup_time", "21:30")),
         "payment_method": data.get("payment_method", "free"),
         "notes": data.get("notes", ""),
@@ -1066,7 +1509,7 @@ def accept_alert(alert_id):
         print(f"SMS error: {e}")
     
     return jsonify({
-        "message": "Alert accepted! Restaurant notified.",
+        "message": f"Alert accepted! {get_provider_label(provider_type)} notified.",
         "order": serialize_document({**order, "_id": inserted_order.inserted_id}),
         "alert": serialize_document(updated_alert)
     }), 200
@@ -1152,9 +1595,15 @@ def mark_order_collected(order_id):
 @role_required("admin")
 def admin_dashboard():
     start_of_day = datetime.combine(datetime.now().date(), datetime.min.time())
+    provider_counts = {role: 0 for role in PROVIDER_ROLES}
+    for provider in restaurants_col.find():
+        provider_counts[get_provider_type(provider)] += 1
 
     # Get statistics
-    total_restaurants = restaurants_col.count_documents({})
+    total_restaurants = provider_counts["restaurant"]
+    total_hotels = provider_counts["hotel"]
+    total_banquets = provider_counts["banquet"]
+    total_providers = sum(provider_counts.values())
     total_ngos = ngos_col.count_documents({})
     active_alerts_today = alerts_col.count_documents({
         "created_at": {"$gte": start_of_day}
@@ -1162,12 +1611,12 @@ def admin_dashboard():
     
     # Today's food saved
     today_food_saved = 0
-    collected_alerts = list(alerts_col.find({
-        "status": "collected",
+    collected_orders = list(orders_col.find({
+        "status": "Collected",
         "created_at": {"$gte": start_of_day}
     }))
-    for alert in collected_alerts:
-        today_food_saved += alert.get("surplus_meals", 0)
+    for order in collected_orders:
+        today_food_saved += safe_int(order.get("total_portions", 0))
     
     # Recent alerts
     recent_alerts = list(alerts_col.find().sort("created_at", pymongo.DESCENDING).limit(10))
@@ -1175,7 +1624,10 @@ def admin_dashboard():
     
     return jsonify({
         "stats": {
+            "total_providers": total_providers,
             "total_restaurants": total_restaurants,
+            "total_hotels": total_hotels,
+            "total_banquets": total_banquets,
             "total_ngos": total_ngos,
             "active_alerts_today": active_alerts_today,
             "food_saved_today": today_food_saved
@@ -1187,13 +1639,25 @@ def admin_dashboard():
 @role_required("admin")
 def get_all_users():
     users = list(users_col.find({}, {"password": 0}))
-    return jsonify({"users": [serialize_document(user) for user in users]}), 200
+    hydrated_users = []
+    for user in users:
+        if is_provider_role(user.get("role")):
+            profile = restaurants_col.find_one({"email": user.get("email")}) or {}
+            user = {
+                **user,
+                "provider_type": get_provider_type(profile or user),
+                "price_per_portion": profile.get("price_per_portion", user.get("price_per_portion")),
+                "minimum_pickup": profile.get("minimum_pickup", user.get("minimum_pickup")),
+            }
+        hydrated_users.append(user)
+    return jsonify({"users": [serialize_document(user) for user in hydrated_users]}), 200
 
 @app.route("/api/admin/add-restaurant", methods=["POST"])
 @role_required("admin")
 def add_restaurant():
-    data = request.json
+    data = request.json or {}
     email = data.get("email")
+    role = get_provider_type(data.get("role", "restaurant"))
     
     if users_col.find_one({"email": email}):
         return jsonify({"error": "User already exists"}), 400
@@ -1204,33 +1668,45 @@ def add_restaurant():
     user = {
         "email": email,
         "password": password,
-        "role": "restaurant",
+        "role": role,
         "name": data.get("name"),
+        "location": data.get("location", "Unknown"),
+        "phone": data.get("phone", ""),
+        "subscription": "free",
         "created_at": datetime.utcnow()
     }
+    provider_profile = build_provider_profile(email, user=user, payload=data)
+    user.update({
+        "price_per_portion": provider_profile["price_per_portion"],
+        "minimum_pickup": provider_profile["minimum_pickup"],
+        "available_after": provider_profile["available_after"],
+        "daily_surplus_auto_entry": provider_profile["daily_surplus_auto_entry"],
+        "recurring_alerts": provider_profile["recurring_alerts"],
+        "event_name": provider_profile["event_name"],
+        "guest_count": provider_profile["guest_count"],
+        "expected_surplus": provider_profile["expected_surplus"],
+        "closing_time": provider_profile["closing_time"],
+    })
     users_col.insert_one(user)
     
-    restaurants_col.insert_one({
-        "email": email,
-        "name": data.get("name"),
-        "location": data.get("location"),
-        "phone": data.get("phone"),
-        "closing_time": data.get("closing_time", "22:00")
-    })
+    get_or_create_provider_profile(email, user)
     
-    return jsonify({"message": "Restaurant added successfully"}), 201
+    return jsonify({"message": f"{get_provider_label(role)} added successfully"}), 201
 
 @app.route("/api/admin/remove-restaurant/<email>", methods=["DELETE"])
 @role_required("admin")
 def remove_restaurant(email):
-    users_col.delete_one({"email": email, "role": "restaurant"})
+    user = users_col.find_one({"email": email})
+    if not user or not is_provider_role(user.get("role")):
+        return jsonify({"error": "Provider not found"}), 404
+    users_col.delete_one({"email": email})
     restaurants_col.delete_one({"email": email})
-    return jsonify({"message": "Restaurant removed"}), 200
+    return jsonify({"message": f"{get_provider_label(user.get('role'))} removed"}), 200
 
 @app.route("/api/admin/add-ngo", methods=["POST"])
 @role_required("admin")
 def add_ngo():
-    data = request.json
+    data = request.json or {}
     email = data.get("email")
     
     if users_col.find_one({"email": email}):
@@ -1243,17 +1719,14 @@ def add_ngo():
         "password": password,
         "role": "ngo",
         "name": data.get("name"),
+        "location": data.get("location", "Unknown"),
+        "phone": data.get("phone", ""),
+        "subscription": "free",
         "created_at": datetime.utcnow()
     }
     users_col.insert_one(user)
     
-    ngos_col.insert_one({
-        "email": email,
-        "name": data.get("name"),
-        "location": data.get("location"),
-        "phone": data.get("phone"),
-        "active": True
-    })
+    get_or_create_ngo_profile(email, user)
     
     return jsonify({"message": "NGO added successfully"}), 201
 
@@ -1341,53 +1814,32 @@ def update_sales():
 
 # ==================== SUBSCRIPTION ROUTES ====================
 @app.route("/api/subscription/plans", methods=["GET"])
+@role_required(*PROVIDER_ROLES)
 def get_subscription_plans():
-    plans = [
-        {
-            "id": "free",
-            "name": "Free Plan",
-            "price": 0,
-            "features": [
-                "Basic alerts",
-                "Limited daily requests (5/day)",
-                "Basic dashboard"
-            ],
-            "limitations": {
-                "daily_requests": 5,
-                "ai_predictions": False,
-                "priority_matching": False
-            }
-        },
-        {
-            "id": "premium",
-            "name": "⭐ Premium Plan",
-            "price": 199,
-            "features": [
-                "Unlimited alerts",
-                "Ollama forecasts",
-                "Priority NGO matching",
-                "Advanced analytics",
-                "24/7 support"
-            ],
-            "limitations": {
-                "daily_requests": -1,  # unlimited
-                "ai_predictions": True,
-                "priority_matching": True
-            }
-        }
-    ]
-    return jsonify({"plans": plans}), 200
+    current_user = get_jwt_identity()
+    user = users_col.find_one({"email": current_user}) or {}
+    provider_type = get_provider_type(user)
+    return jsonify({
+        "plans": [build_provider_subscription_plan(provider_type)],
+        "provider_type": provider_type,
+    }), 200
 
 @app.route("/api/subscription/activate", methods=["POST"])
-@role_required("restaurant", "ngo")
+@role_required(*PROVIDER_ROLES)
 def activate_subscription():
     current_user = get_jwt_identity()
-    data = request.json
+    data = request.json or {}
     plan_id = data.get("plan")
     payment_id = data.get("payment_id")
     
     if not plan_id:
         return jsonify({"error": "Plan ID required"}), 400
+    
+    user = users_col.find_one({"email": current_user}) or {}
+    provider_type = get_provider_type(user)
+    expected_plan = build_provider_subscription_plan(provider_type)
+    if plan_id != expected_plan["id"]:
+        return jsonify({"error": f"Invalid plan for {get_provider_label(provider_type).lower()} accounts"}), 400
     
     # Update user subscription
     users_col.update_one(
@@ -1407,13 +1859,18 @@ def activate_subscription():
 @app.route("/api/ai/predict-surplus", methods=["POST"])
 @jwt_required()
 def predict_surplus():
-    data = request.json
+    data = request.json or {}
+    current_user = get_jwt_identity()
+    user = users_col.find_one({"email": current_user}) or {}
+    provider_profile = restaurants_col.find_one({"email": current_user}) or {}
+    provider_type = get_provider_type(data.get("provider_type") or provider_profile or user)
     trained_result = predict_with_trained_surplus_model(
         day_of_week=int(data.get("day_of_week", datetime.now().weekday())),
         food_prepared=float(data.get("food_prepared", 100)),
         food_sold=float(data.get("food_sold", data.get("quantity", 70))),
         hour=int(data.get("hour", datetime.now().hour)),
         month=int(data.get("month", datetime.now().month)),
+        provider_type=provider_type,
     )
     result = build_surplus_prediction(
         ollama_service=ollama_service,
@@ -1422,13 +1879,15 @@ def predict_surplus():
         food_sold=float(data.get("food_sold", data.get("quantity", 70))),
         weather_score=float(data.get("weather_score", 0.7)),
         hour=int(data.get("hour", datetime.now().hour)),
-        historical_entries=list(food_data_col.find({"restaurant_email": get_jwt_identity()})),
+        historical_entries=list(food_data_col.find({"restaurant_email": current_user})),
         baseline_prediction=trained_result["prediction"] if trained_result else None,
         baseline_confidence=trained_result["confidence"] if trained_result else None,
+        provider_type=provider_type,
     )
 
     return jsonify({
         **result,
+        "provider_type": provider_type,
         "prediction_engine": "trained_surplus_model" if trained_result else "heuristic",
         "trained_model": trained_result["metadata"] if trained_result else None,
     }), 200
@@ -1449,12 +1908,13 @@ def predict_surplus():
 @app.route("/api/ai/recommend-ngo", methods=["POST"])
 @jwt_required()
 def recommend_ngo():
-    data = request.json
+    data = request.json or {}
     result = build_ngo_recommendations(
         ollama_service=ollama_service,
         restaurant_location=data.get("location", "Demo Location"),
         surplus_meals=int(data.get("surplus_meals", 20)),
         food_categories=data.get("categories", ["Rice", "Curry"]),
+        provider_type=data.get("provider_type", "restaurant"),
         ngos=list(ngos_col.find({"active": True})),
         order_counts=build_order_counts(),
     )
@@ -1481,7 +1941,7 @@ def get_prediction_accuracy():
 def get_smart_matches():
     result = build_smart_matches(
         ollama_service=ollama_service,
-        active_alerts=list(alerts_col.find({"status": "pending"}).sort("created_at", -1).limit(5)),
+        active_alerts=list(alerts_col.find({"status": {"$in": ["pending", "partially_reserved"]}}).sort("created_at", -1).limit(5)),
         active_ngos=list(ngos_col.find({"active": True})),
         order_counts=build_order_counts(),
     )
@@ -1498,7 +1958,7 @@ def get_admin_insights():
     )
     smart_match_result = build_smart_matches(
         ollama_service=ollama_service,
-        active_alerts=list(alerts_col.find({"status": "pending"}).sort("created_at", -1).limit(5)),
+        active_alerts=list(alerts_col.find({"status": {"$in": ["pending", "partially_reserved"]}}).sort("created_at", -1).limit(5)),
         active_ngos=list(ngos_col.find({"active": True})),
         order_counts=build_order_counts(),
     )
@@ -1509,6 +1969,9 @@ def get_admin_insights():
         "predictions": prediction_result["predictions"],
         "average_accuracy": prediction_result["average_accuracy"],
         "matches": smart_match_result["matches"],
+        "provider_distribution": build_provider_distribution(),
+        "provider_insights": build_provider_insights(),
+        "expansion_message": PLATFORM_EXPANSION_MESSAGE,
         "source": "ollama" if "ollama" in {prediction_result["source"], smart_match_result["source"]} else "fallback",
         "models": {
             "prediction": prediction_result["model"],
@@ -1533,4 +1996,5 @@ def get_ai_status():
 # Run Server
 # -------------------------
 if __name__ == "__main__":
-    app.run(debug=True, port=5000)
+    debug_enabled = os.getenv("FLASK_DEBUG", "").strip().lower() in {"1", "true", "yes", "on"}
+    app.run(host="0.0.0.0", debug=debug_enabled, port=int(os.getenv("PORT", "5000")))
