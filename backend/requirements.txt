@@ -1,0 +1,9 @@
+Flask
+Flask-Cors
+Flask-JWT-Extended
+bcrypt
+pymongo
+twilio
+APScheduler
+numpy
+scikit-learn

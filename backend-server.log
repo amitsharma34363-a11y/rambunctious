@@ -1,0 +1,3 @@
+⚠️ MongoDB not available, using mock mode: No servers found yet, Timeout: 2.0s, Topology Description: <TopologyDescription id: 69c52e9bcb754571bc70102c, topology_type: Unknown, servers: [<ServerDescription ('localhost', 27017) server_type: Unknown, rtt: None>]>
+ * Serving Flask app 'app'
+ * Debug mode: on
