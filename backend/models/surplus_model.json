@@ -1,0 +1,40 @@
+{
+  "trained_at": "2026-03-26T18:27:26.779282+00:00",
+  "dataset_path": "E:\\Admin\\final_merged_ai_dataset.csv",
+  "feature_names": [
+    "hour",
+    "day_of_week",
+    "month",
+    "is_weekend",
+    "quantity",
+    "food_prepared"
+  ],
+  "medians": {
+    "hour": 12.0,
+    "day_of_week": 3.0,
+    "month": 7.0,
+    "is_weekend": 0.0,
+    "quantity": 1.0,
+    "food_prepared": 1.2
+  },
+  "coefficients": {
+    "hour": 7.540567580029695e-15,
+    "day_of_week": 7.771561172376096e-16,
+    "month": 4.407823932239818e-15,
+    "is_weekend": 3.300864356153843e-14,
+    "quantity": 0.08196721311475515,
+    "food_prepared": 0.09836065573770282
+  },
+  "intercept": -1.0702549957386509e-13,
+  "metrics": {
+    "mae": 2.965866489390615e-14,
+    "r2": 1.0,
+    "test_rows": 1848
+  },
+  "dataset_summary": {
+    "rows": 9239,
+    "columns": 9,
+    "target": "surplus",
+    "note": "This dataset encodes surplus directly from operational inputs, so the trained model learns a near-exact arithmetic mapping rather than future demand behavior."
+  }
+}

@@ -5,5 +5,5 @@ bcrypt
 pymongo
 twilio
 APScheduler
-numpy
+pandas
 scikit-learn

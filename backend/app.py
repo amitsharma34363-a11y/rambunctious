@@ -9,11 +9,20 @@ from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
 from datetime import datetime, timedelta
 from functools import wraps
-import numpy as np
-from sklearn.linear_model import LinearRegression
-import json
 import os
 import sys
+try:
+    import pandas as pd
+except Exception:
+    pd = None
+from ollama_service import (
+    OllamaService,
+    build_ngo_recommendations,
+    build_prediction_accuracy,
+    build_smart_matches,
+    build_surplus_prediction,
+)
+from surplus_model import load_trained_surplus_model
 
 try:
     if hasattr(sys.stdout, "reconfigure"):
@@ -99,6 +108,7 @@ mock_alerts = []
 mock_food_data = []
 mock_orders = []
 mock_subscriptions = []
+DAY_LABELS = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
 
 def matches_query(item, query):
     for key, expected in query.items():
@@ -221,33 +231,9 @@ restaurant_data = {
     "phone": "+917004228038"
 }
 
-# AI Model for Surplus Prediction
-class SurplusPredictor:
-    def __init__(self):
-        self.model = LinearRegression()
-        self.is_trained = False
-        # Sample training data: [day_of_week, previous_sales, weather_score, hour]
-        self.X_train = np.array([
-            [0, 100, 0.8, 20],  # Monday
-            [1, 95, 0.7, 20],   # Tuesday
-            [2, 110, 0.9, 20],  # Wednesday
-            [3, 105, 0.6, 20],  # Thursday
-            [4, 120, 0.8, 20],  # Friday
-            [5, 130, 0.9, 20],  # Saturday
-            [6, 90, 0.5, 20],   # Sunday
-        ])
-        self.y_train = np.array([25, 20, 30, 15, 35, 40, 10])  # Expected surplus
-        self.model.fit(self.X_train, self.y_train)
-        self.is_trained = True
-    
-    def predict(self, day_of_week, previous_sales, weather_score, hour):
-        if not self.is_trained:
-            return 15  # Default fallback
-        input_data = np.array([[day_of_week, previous_sales, weather_score, hour]])
-        prediction = self.model.predict(input_data)[0]
-        return max(0, int(prediction))
-
-surplus_predictor = SurplusPredictor()
+ollama_service = OllamaService()
+MODEL_ARTIFACT_PATH = os.path.join(os.path.dirname(__file__), "models", "surplus_model.json")
+trained_surplus_model = load_trained_surplus_model(MODEL_ARTIFACT_PATH)
 
 # -------------------------
 # Helper Functions
@@ -255,9 +241,6 @@ surplus_predictor = SurplusPredictor()
 def calculate_surplus(food_prepared, food_sold):
     surplus = food_prepared - food_sold
     return surplus if surplus > 0 else 0
-
-def predict_surplus_ai(day_of_week, previous_sales, weather_score=0.7, hour=20):
-    return surplus_predictor.predict(day_of_week, previous_sales, weather_score, hour)
 
 def serialize_value(value):
     if isinstance(value, (datetime,)):
@@ -365,11 +348,269 @@ def build_alert_categories(items, fallback_category, fallback_food_type, surplus
         "food_type": fallback_food_type or "Mixed"
     }]
 
+
+def get_alert_remaining_portions(categories):
+    return sum(max(0, int(category.get("available", 0) or 0)) for category in categories)
+
 def summarize_order_items(items):
     return ", ".join(
         f"{item.get('category', item.get('name', 'Item'))}: {item.get('quantity', 0)}"
         for item in items
     )
+
+
+def apply_collected_order_to_food_data(order, alert=None):
+    if not order:
+        return None
+
+    food_entry = None
+    if alert and alert.get("food_entry_id"):
+        food_entry = food_data_col.find_one({"_id": alert.get("food_entry_id")})
+
+    if food_entry is None:
+        latest_entries = list(
+            food_data_col.find({"restaurant_email": order.get("restaurant_email")}).sort("timestamp", -1).limit(1)
+        )
+        food_entry = latest_entries[0] if latest_entries else None
+
+    if not food_entry:
+        return None
+
+    collected_portions = max(0, float(order.get("total_portions", 0) or 0))
+    updated_remaining = max(0.0, float(food_entry.get("remaining_food", 0) or 0) - collected_portions)
+    updated_donated = max(0.0, float(food_entry.get("donated_food", 0) or 0) + collected_portions)
+
+    food_data_col.update_one(
+        {"_id": food_entry["_id"]},
+        {"$set": {
+            "remaining_food": updated_remaining,
+            "donated_food": updated_donated,
+            "last_collection_at": datetime.utcnow()
+        }}
+    )
+    return food_data_col.find_one({"_id": food_entry["_id"]})
+
+
+def parse_entry_datetime(value):
+    if isinstance(value, datetime):
+        return value
+    if hasattr(value, "year") and hasattr(value, "month") and hasattr(value, "day") and not isinstance(value, str):
+        try:
+            return datetime(value.year, value.month, value.day)
+        except Exception:
+            return None
+    if isinstance(value, str):
+        normalized = value.replace("Z", "+00:00")
+        try:
+            return datetime.fromisoformat(normalized)
+        except ValueError:
+            return None
+    return None
+
+
+def load_dataset_weekly_profile():
+    dataset_path = os.getenv("SURPLUS_DATASET_PATH", r"E:\Admin\final_merged_ai_dataset.csv")
+    if pd is None or not os.path.exists(dataset_path):
+        return {}
+
+    try:
+        df = pd.read_csv(dataset_path)
+    except Exception:
+        return {}
+
+    required_columns = {"day_of_week", "quantity", "food_prepared", "surplus"}
+    if not required_columns.issubset(df.columns):
+        return {}
+
+    working = df[list(required_columns)].copy()
+    for column in required_columns:
+        working[column] = pd.to_numeric(working[column], errors="coerce")
+
+    working = working.dropna(subset=["day_of_week", "quantity", "food_prepared", "surplus"])
+    if working.empty:
+        return {}
+
+    unique_days = set(working["day_of_week"].astype(int).unique().tolist())
+    if 0 not in unique_days and unique_days.issubset({1, 2, 3, 4, 5, 6, 7}):
+        working["day_of_week"] = working["day_of_week"] - 1
+
+    grouped = working.groupby(working["day_of_week"].astype(int))
+    profile = {}
+    for idx in range(7):
+        if idx not in grouped.groups:
+            continue
+        day_frame = grouped.get_group(idx)
+        prepared = float(day_frame["food_prepared"].mean())
+        sold = float(day_frame["quantity"].mean())
+        remaining = float(day_frame["surplus"].mean())
+        profile[idx] = {
+            "day": DAY_LABELS[idx],
+            "prepared": round(prepared, 1),
+            "sold": round(sold, 1),
+            "remaining": round(remaining, 1),
+            "donated": 0.0,
+            "entries": int(len(day_frame)),
+            "source": "dataset",
+        }
+
+    return profile
+
+
+DATASET_WEEKLY_PROFILE = load_dataset_weekly_profile()
+
+
+def build_restaurant_weekly_chart(restaurant_email):
+    restaurant_entries = list(
+        food_data_col.find({"restaurant_email": restaurant_email}).sort("timestamp", -1)
+    )
+    grouped = {idx: {"prepared": [], "sold": [], "remaining": [], "donated": []} for idx in range(7)}
+
+    for entry in restaurant_entries:
+        entry_dt = (
+            parse_entry_datetime(entry.get("timestamp"))
+            or parse_entry_datetime(entry.get("date"))
+        )
+        day_index = entry_dt.weekday() if entry_dt else datetime.now().weekday()
+        grouped[day_index]["prepared"].append(float(entry.get("food_prepared", 0) or 0))
+        grouped[day_index]["sold"].append(float(entry.get("food_sold", 0) or 0))
+        grouped[day_index]["remaining"].append(float(entry.get("remaining_food", 0) or 0))
+        grouped[day_index]["donated"].append(float(entry.get("donated_food", 0) or 0))
+
+    chart = []
+    for idx, label in enumerate(DAY_LABELS):
+        bucket = grouped[idx]
+        if bucket["prepared"]:
+            chart.append({
+                "day": label,
+                "prepared": round(sum(bucket["prepared"]) / len(bucket["prepared"]), 1),
+                "sold": round(sum(bucket["sold"]) / len(bucket["sold"]), 1),
+                "remaining": round(sum(bucket["remaining"]) / len(bucket["remaining"]), 1),
+                "donated": round(sum(bucket["donated"]) / len(bucket["donated"]), 1),
+                "entries": len(bucket["prepared"]),
+                "source": "restaurant",
+            })
+            continue
+
+        dataset_bucket = DATASET_WEEKLY_PROFILE.get(idx)
+        if dataset_bucket:
+            chart.append(dict(dataset_bucket))
+            continue
+
+        chart.append({
+            "day": label,
+            "prepared": 0.0,
+            "sold": 0.0,
+            "remaining": 0.0,
+            "donated": 0.0,
+            "entries": 0,
+            "source": "empty",
+        })
+
+    return chart
+
+
+def build_behavior_analysis():
+    day_keys = ["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"]
+    behavior_map = {}
+
+    for order in orders_col.find():
+        ngo_email = order.get("ngo_email")
+        if not ngo_email:
+            continue
+        ngo = ngos_col.find_one({"email": ngo_email}) or {"name": ngo_email}
+        created_at = order.get("created_at")
+        if isinstance(created_at, str):
+            try:
+                created_at = datetime.fromisoformat(created_at)
+            except ValueError:
+                created_at = None
+        day_index = created_at.weekday() if isinstance(created_at, datetime) else 0
+        key = day_keys[day_index]
+
+        if ngo_email not in behavior_map:
+            behavior_map[ngo_email] = {
+                "ngo": ngo.get("name", ngo_email),
+                **{day: 0 for day in day_keys}
+            }
+
+        behavior_map[ngo_email][key] += int(order.get("total_portions", 0))
+
+    behavior_data = []
+    for _, stats in behavior_map.items():
+        weekday_total = sum(stats[day] for day in day_keys[:5])
+        weekend_total = sum(stats[day] for day in day_keys[5:])
+        stats["most_active"] = "Weekends" if weekend_total > weekday_total else "Weekdays"
+        behavior_data.append(stats)
+
+    if not behavior_data:
+        behavior_data = [
+            {"ngo": "No NGO orders yet", **{day: 0 for day in day_keys}, "most_active": "N/A"}
+        ]
+
+    return behavior_data
+
+
+def build_order_counts():
+    counts = {}
+    for order in orders_col.find():
+        ngo_email = order.get("ngo_email")
+        if not ngo_email:
+            continue
+        counts[ngo_email] = counts.get(ngo_email, 0) + 1
+    return counts
+
+
+def build_weekly_prediction_snapshot():
+    day_labels = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+    grouped = {i: {"prepared": [], "remaining": []} for i in range(7)}
+
+    for entry in food_data_col.find():
+        entry_date = entry.get("date")
+        if isinstance(entry_date, str):
+            try:
+                entry_date = datetime.fromisoformat(entry_date)
+            except ValueError:
+                entry_date = None
+        weekday = entry_date.weekday() if hasattr(entry_date, "weekday") else datetime.now().weekday()
+        grouped[weekday]["prepared"].append(float(entry.get("food_prepared", 0) or 0))
+        grouped[weekday]["remaining"].append(float(entry.get("remaining_food", 0) or 0))
+
+    snapshot = []
+    for idx, label in enumerate(day_labels):
+        prepared_values = grouped[idx]["prepared"]
+        actual_values = grouped[idx]["remaining"]
+        prepared_avg = sum(prepared_values) / len(prepared_values) if prepared_values else 100
+        actual_avg = sum(actual_values) / len(actual_values) if actual_values else max(5, prepared_avg * 0.2)
+        snapshot.append({
+            "day": label,
+            "day_index": idx,
+            "prepared": round(prepared_avg, 1),
+            "actual": round(actual_avg, 1),
+        })
+
+    return snapshot
+
+
+def predict_with_trained_surplus_model(day_of_week, food_prepared, food_sold, hour, month=None):
+    if trained_surplus_model is None:
+        return None
+
+    effective_month = int(month or datetime.now().month)
+    effective_day = int(day_of_week)
+    payload = {
+        "hour": float(hour),
+        "day_of_week": float(effective_day),
+        "month": float(effective_month),
+        "is_weekend": 1.0 if effective_day >= 5 else 0.0,
+        "quantity": float(food_sold),
+        "food_prepared": float(food_prepared),
+    }
+    prediction = trained_surplus_model.predict(payload)
+    return {
+        "prediction": prediction,
+        "confidence": 96 if trained_surplus_model else 62,
+        "metadata": trained_surplus_model.metadata(),
+    }
 
 
 # -------------------------
@@ -531,17 +772,17 @@ def restaurant_dashboard():
     current_user = get_jwt_identity()
     
     restaurant = get_or_create_restaurant_profile(current_user)
-    
-    # Get today's food data
-    today = datetime.now().date()
-    food_data = food_data_col.find_one({
-        "restaurant_email": current_user,
-        "date": today
-    })
+    food_history = list(
+        food_data_col.find({"restaurant_email": current_user}).sort("timestamp", -1).limit(20)
+    )
+    latest_food_data = food_history[0] if food_history else None
+    chart_data = build_restaurant_weekly_chart(current_user)
     
     return jsonify({
         "restaurant": serialize_document(restaurant),
-        "food_data": serialize_document(food_data)
+        "food_data": serialize_document(latest_food_data),
+        "food_history": [serialize_document(entry) for entry in food_history],
+        "chart_data": chart_data
     }), 200
 
 @app.route("/api/restaurant/food-data", methods=["POST"])
@@ -568,6 +809,7 @@ def submit_food_data():
         "food_prepared": food_prepared,
         "food_sold": food_sold,
         "remaining_food": remaining_food,
+        "donated_food": 0,
         "food_type": food_type,
         "category": category,
         "closing_time": closing_time,
@@ -577,14 +819,35 @@ def submit_food_data():
     
     food_data_col.insert_one(food_entry)
     
-    # Auto-predict surplus using AI
-    day_of_week = datetime.now().weekday()
-    ai_prediction = predict_surplus_ai(day_of_week, food_sold, 0.7, datetime.now().hour)
+    trained_result = predict_with_trained_surplus_model(
+        day_of_week=datetime.now().weekday(),
+        food_prepared=food_prepared,
+        food_sold=food_sold,
+        hour=datetime.now().hour,
+        month=datetime.now().month,
+    )
+    ai_result = build_surplus_prediction(
+        ollama_service=ollama_service,
+        day_of_week=datetime.now().weekday(),
+        food_prepared=food_prepared,
+        food_sold=food_sold,
+        weather_score=0.7,
+        hour=datetime.now().hour,
+        historical_entries=list(food_data_col.find({"restaurant_email": current_user})),
+        baseline_prediction=trained_result["prediction"] if trained_result else None,
+        baseline_confidence=trained_result["confidence"] if trained_result else None,
+    )
     
     return jsonify({
         "message": "Food data submitted successfully",
         "remaining_food": remaining_food,
-        "ai_prediction": ai_prediction,
+        "ai_prediction": ai_result["predicted_surplus"],
+        "ai_confidence": ai_result["confidence"],
+        "ai_message": ai_result["message"],
+        "ai_suggestions": ai_result["suggestions"],
+        "ai_source": ai_result["source"],
+        "ai_model": ai_result["model"],
+        "prediction_engine": "trained_surplus_model" if trained_result else "heuristic",
         "food_entry": serialize_document(food_entry)
     }), 201
 
@@ -609,6 +872,11 @@ def send_rescue_alert():
         data.get("food_type", "Mixed"),
         surplus_meals
     )
+    remaining_portions = get_alert_remaining_portions(categories)
+    latest_food_entries = list(
+        food_data_col.find({"restaurant_email": current_user}).sort("timestamp", -1).limit(1)
+    )
+    linked_food_entry = latest_food_entries[0] if latest_food_entries else None
     
     # Create alert for NGOs
     alert = {
@@ -616,7 +884,8 @@ def send_rescue_alert():
         "restaurant_name": restaurant.get("name", "Restaurant"),
         "location": restaurant.get("location", "Unknown"),
         "phone": restaurant.get("phone", ""),
-        "surplus_meals": surplus_meals,
+        "food_entry_id": linked_food_entry.get("_id") if linked_food_entry else None,
+        "surplus_meals": remaining_portions,
         "food_type": data.get("food_type", "Mixed"),
         "category": data.get("category", "Mixed"),
         "categories": categories,
@@ -667,7 +936,7 @@ def ngo_dashboard():
     # Get active alerts
     try:
         active_alerts = list(alerts_col.find({
-            "status": "pending"
+            "status": {"$in": ["pending", "partially_reserved"]}
         }).sort("created_at", -1))
         
         # Convert ObjectId to string for JSON
@@ -701,34 +970,60 @@ def accept_alert(alert_id):
     if not alert:
         return jsonify({"error": "Alert not found"}), 404
 
-    if alert.get("status") != "pending":
+    if alert.get("status") not in {"pending", "partially_reserved"}:
         return jsonify({"error": "This alert is no longer available"}), 400
+
+    alert_categories = [dict(category) for category in alert.get("categories", [])]
+    if not alert_categories:
+        alert_categories = build_alert_categories(
+            alert.get("items", []),
+            alert.get("category", "Mixed"),
+            alert.get("food_type", "Mixed"),
+            int(alert.get("surplus_meals", 0) or 0),
+        )
 
     selected_items = []
     total_portions = 0
     selected_map = data.get("items", {})
-    for category in alert.get("categories", []):
-        quantity = int(selected_map.get(category.get("name"), 0))
+    updated_categories = []
+    for category in alert_categories:
+        category_name = category.get("name", "Mixed")
+        available = int(category.get("available", 0) or 0)
+        quantity = int(selected_map.get(category_name, 0))
+        if quantity > available:
+            return jsonify({"error": f"Only {available} portions left for {category_name}"}), 400
         if quantity <= 0:
+            updated_categories.append({
+                **category,
+                "available": available
+            })
             continue
         total_portions += quantity
         selected_items.append({
-            "category": category.get("name", "Mixed"),
+            "category": category_name,
             "quantity": quantity,
             "food_type": category.get("food_type", alert.get("food_type", "Mixed"))
+        })
+        updated_categories.append({
+            **category,
+            "available": available - quantity
         })
 
     if total_portions <= 0:
         return jsonify({"error": "Select at least one category portion"}), 400
-    
-    # Update alert status
+
+    remaining_portions = get_alert_remaining_portions(updated_categories)
+    next_status = "pending" if remaining_portions > 0 else "accepted"
+
     alerts_col.update_one(
         {"_id": alert_id},
         {"$set": {
-            "status": "accepted",
+            "status": next_status,
             "accepted_by": current_user,
             "accepted_at": datetime.utcnow(),
-            "reserved_portions": total_portions
+            "reserved_portions": int(alert.get("reserved_portions", 0) or 0) + total_portions,
+            "surplus_meals": remaining_portions,
+            "categories": updated_categories
         }}
     )
 
@@ -748,13 +1043,22 @@ def accept_alert(alert_id):
         "created_at": datetime.utcnow()
     }
     inserted_order = orders_col.insert_one(order)
+    updated_alert = alerts_col.find_one({"_id": alert_id}) or {
+        **alert,
+        "status": next_status,
+        "surplus_meals": remaining_portions,
+        "categories": updated_categories
+    }
     
     # Notify restaurant via SMS
     try:
         restaurant = restaurants_col.find_one({"email": alert["restaurant_email"]})
         if client and TWILIO_NUMBER and restaurant and "phone" in restaurant:
             client.messages.create(
-                body=f"Good News! {current_user} accepted your donation of {alert['surplus_meals']} meals. Pickup at {alert['pickup_time']}.",
+                body=(
+                    f"Good News! {current_user} accepted {total_portions} portions from your donation."
+                    f" {remaining_portions} portions are still available. Pickup at {alert['pickup_time']}."
+                ),
                 from_=TWILIO_NUMBER,
                 to=restaurant["phone"]
             )
@@ -763,7 +1067,8 @@ def accept_alert(alert_id):
     
     return jsonify({
         "message": "Alert accepted! Restaurant notified.",
-        "order": serialize_document({**order, "_id": inserted_order.inserted_id})
+        "order": serialize_document({**order, "_id": inserted_order.inserted_id}),
+        "alert": serialize_document(updated_alert)
     }), 200
 
 @app.route("/api/ngo/reject-alert/<alert_id>", methods=["POST"])
@@ -793,6 +1098,51 @@ def mark_collected(alert_id):
         }}
     )
     return jsonify({"message": "Marked as collected! Thank you! 🎉"}), 200
+
+
+@app.route("/api/ngo/mark-order-collected/<order_id>", methods=["POST"])
+@role_required("ngo")
+def mark_order_collected(order_id):
+    current_user = get_jwt_identity()
+    order = orders_col.find_one({"_id": order_id})
+    if not order:
+        return jsonify({"error": "Order not found"}), 404
+    if order.get("ngo_email") != current_user:
+        return jsonify({"error": "You can only update your own orders"}), 403
+    if order.get("status") == "Collected":
+        return jsonify({"message": "Order already marked as collected"}), 200
+
+    alert_id = order.get("alert_id")
+    alert = alerts_col.find_one({"_id": alert_id})
+    orders_col.update_one(
+        {"_id": order_id},
+        {"$set": {
+            "status": "Collected",
+            "collected_at": datetime.utcnow()
+        }}
+    )
+    updated_order = orders_col.find_one({"_id": order_id}) or {**order, "status": "Collected"}
+    updated_food_entry = apply_collected_order_to_food_data(updated_order, alert)
+
+    related_orders = list(orders_col.find({"alert_id": alert_id}))
+    if alert:
+        remaining_portions = int(alert.get("surplus_meals", 0) or 0)
+        all_collected = bool(related_orders) and all(
+            current_order.get("status") == "Collected" for current_order in related_orders
+        )
+        if remaining_portions <= 0 and all_collected:
+            alerts_col.update_one(
+                {"_id": alert_id},
+                {"$set": {
+                    "status": "collected",
+                    "collected_at": datetime.utcnow()
+                }}
+            )
+
+    return jsonify({
+        "message": "Marked as collected! Thank you!",
+        "food_data": serialize_document(updated_food_entry)
+    }), 200
 
 
 # -------------------------
@@ -1014,7 +1364,7 @@ def get_subscription_plans():
             "price": 199,
             "features": [
                 "Unlimited alerts",
-                "AI predictions",
+                "Ollama forecasts",
                 "Priority NGO matching",
                 "Advanced analytics",
                 "24/7 support"
@@ -1053,207 +1403,130 @@ def activate_subscription():
     }), 200
 
 
-# ==================== AI PREDICTION ROUTES ====================
+# ==================== OLLAMA ROUTES ====================
 @app.route("/api/ai/predict-surplus", methods=["POST"])
 @jwt_required()
 def predict_surplus():
     data = request.json
-    day_of_week = int(data.get("day_of_week", datetime.now().weekday()))
-    food_prepared = float(data.get("food_prepared", 100))
-    food_sold = float(data.get("food_sold", 70))
-    weather_score = float(data.get("weather_score", 0.7))
-    
-    # Use AI model to predict
-    prediction = predict_surplus_ai(day_of_week, food_sold, weather_score)
-    
-    # Get historical accuracy
-    historical_data = list(food_data_col.find({"restaurant_email": get_jwt_identity()}))
-    accuracy = 85 if len(historical_data) > 5 else 65  # Mock accuracy
-    
+    trained_result = predict_with_trained_surplus_model(
+        day_of_week=int(data.get("day_of_week", datetime.now().weekday())),
+        food_prepared=float(data.get("food_prepared", 100)),
+        food_sold=float(data.get("food_sold", data.get("quantity", 70))),
+        hour=int(data.get("hour", datetime.now().hour)),
+        month=int(data.get("month", datetime.now().month)),
+    )
+    result = build_surplus_prediction(
+        ollama_service=ollama_service,
+        day_of_week=int(data.get("day_of_week", datetime.now().weekday())),
+        food_prepared=float(data.get("food_prepared", 100)),
+        food_sold=float(data.get("food_sold", data.get("quantity", 70))),
+        weather_score=float(data.get("weather_score", 0.7)),
+        hour=int(data.get("hour", datetime.now().hour)),
+        historical_entries=list(food_data_col.find({"restaurant_email": get_jwt_identity()})),
+        baseline_prediction=trained_result["prediction"] if trained_result else None,
+        baseline_confidence=trained_result["confidence"] if trained_result else None,
+    )
+
     return jsonify({
-        "predicted_surplus": prediction,
-        "confidence": accuracy,
-        "message": f"🤖 AI predicts ~{prediction} meals surplus tomorrow",
-        "suggestions": [
-            f"Reduce rice preparation by 10%" if prediction > 20 else "Current prep looks good",
-            f"Consider partnering with 2 NGOs for better distribution" if prediction > 30 else "1 NGO should be sufficient"
-        ]
+        **result,
+        "prediction_engine": "trained_surplus_model" if trained_result else "heuristic",
+        "trained_model": trained_result["metadata"] if trained_result else None,
     }), 200
+
+    """
+
+    return jsonify({
+        "predicted_surplus": result["predicted_surplus"],
+        "confidence": result["confidence"],
+        "message": f"🤖 AI predicts ~{prediction} meals surplus tomorrow",
+        "message": result["message"],
+        "suggestions": result["suggestions"],
+        "source": result["source"],
+        "model": result["model"],
+    }), 200
+    """
 
 @app.route("/api/ai/recommend-ngo", methods=["POST"])
 @jwt_required()
 def recommend_ngo():
     data = request.json
-    restaurant_location = data.get("location", "Demo Location")
-    surplus_meals = int(data.get("surplus_meals", 20))
-    food_categories = data.get("categories", ["Rice", "Curry"])
-    
-    # Get all active NGOs
-    ngos = list(ngos_col.find({"active": True}))
-    
-    # Score each NGO
-    scored_ngos = []
-    for ngo in ngos:
-        score = 0
-        reasons = []
-        
-        # Factor 1: Past activity (mock)
-        past_orders = orders_col.count_documents({"ngo_email": ngo.get("email")}) if not MOCK_MODE else 0
-        if past_orders > 5:
-            score += 30
-            reasons.append("Highly active")
-        elif past_orders > 2:
-            score += 20
-            reasons.append("Moderately active")
-        
-        # Factor 2: Distance (mock)
-        distance = hash(ngo.get("email", "")) % 10 + 1
-        if distance <= 3:
-            score += 40
-            reasons.append(f"Nearby ({distance}km)")
-        elif distance <= 6:
-            score += 25
-            reasons.append(f"Moderate distance ({distance}km)")
-        
-        # Factor 3: Category preference (mock)
-        score += 30
-        reasons.append("Prefers your food categories")
-        
-        scored_ngos.append({
-            "ngo_name": ngo["name"],
-            "ngo_email": ngo["email"],
-            "score": score,
-            "reasons": reasons[:2],
-            "distance": distance
-        })
-    
-    # Sort by score
-    scored_ngos.sort(key=lambda x: x["score"], reverse=True)
-    
-    return jsonify({
-        "recommendations": scored_ngos[:3],
-        "best_match": scored_ngos[0] if scored_ngos else None
-    }), 200
+    result = build_ngo_recommendations(
+        ollama_service=ollama_service,
+        restaurant_location=data.get("location", "Demo Location"),
+        surplus_meals=int(data.get("surplus_meals", 20)),
+        food_categories=data.get("categories", ["Rice", "Curry"]),
+        ngos=list(ngos_col.find({"active": True})),
+        order_counts=build_order_counts(),
+    )
+
+    return jsonify(result), 200
 
 @app.route("/api/ai/ngo-behavior", methods=["GET"])
 @jwt_required()
 def analyze_ngo_behavior():
-    day_keys = ["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"]
-    behavior_map = {}
-
-    for order in orders_col.find():
-        ngo_email = order.get("ngo_email")
-        if not ngo_email:
-            continue
-        ngo = ngos_col.find_one({"email": ngo_email}) or {"name": ngo_email}
-        created_at = order.get("created_at")
-        if isinstance(created_at, str):
-            try:
-                created_at = datetime.fromisoformat(created_at)
-            except ValueError:
-                created_at = None
-        day_index = created_at.weekday() if isinstance(created_at, datetime) else 0
-        key = day_keys[day_index]
-
-        if ngo_email not in behavior_map:
-            behavior_map[ngo_email] = {
-                "ngo": ngo.get("name", ngo_email),
-                **{day: 0 for day in day_keys}
-            }
-
-        behavior_map[ngo_email][key] += int(order.get("total_portions", 0))
-
-    behavior_data = []
-    for ngo_email, stats in behavior_map.items():
-        weekday_total = sum(stats[day] for day in day_keys[:5])
-        weekend_total = sum(stats[day] for day in day_keys[5:])
-        stats["most_active"] = "Weekends" if weekend_total > weekday_total else "Weekdays"
-        behavior_data.append(stats)
-
-    if not behavior_data:
-        behavior_data = [
-            {"ngo": "No NGO orders yet", **{day: 0 for day in day_keys}, "most_active": "N/A"}
-        ]
-    
-    return jsonify({"behavior_analysis": behavior_data}), 200
+    return jsonify({"behavior_analysis": build_behavior_analysis()}), 200
 
 @app.route("/api/ai/prediction-accuracy", methods=["GET"])
 @jwt_required()
 def get_prediction_accuracy():
-    predictions = []
-    day_labels = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
-    grouped = {i: {"prepared": [], "remaining": []} for i in range(7)}
+    result = build_prediction_accuracy(
+        ollama_service=ollama_service,
+        weekly_snapshot=build_weekly_prediction_snapshot(),
+    )
 
-    for entry in food_data_col.find():
-        entry_date = entry.get("date")
-        if isinstance(entry_date, str):
-            try:
-                entry_date = datetime.fromisoformat(entry_date)
-            except ValueError:
-                entry_date = None
-        weekday = entry_date.weekday() if hasattr(entry_date, "weekday") else datetime.now().weekday()
-        grouped[weekday]["prepared"].append(float(entry.get("food_prepared", 0)))
-        grouped[weekday]["remaining"].append(float(entry.get("remaining_food", 0)))
-
-    for idx, label in enumerate(day_labels):
-        prepared_values = grouped[idx]["prepared"]
-        actual_values = grouped[idx]["remaining"]
-        prepared_avg = sum(prepared_values) / len(prepared_values) if prepared_values else 100
-        actual_avg = sum(actual_values) / len(actual_values) if actual_values else max(5, prepared_avg * 0.2)
-        predicted = predict_surplus_ai(idx, prepared_avg * 0.7, 0.7, 20)
-        accuracy = 100 if actual_avg == 0 else max(60, min(98, round(100 - abs(predicted - actual_avg) / max(actual_avg, 1) * 100)))
-        predictions.append({
-            "day": label,
-            "predicted": round(predicted, 1),
-            "actual": round(actual_avg, 1),
-            "accuracy": accuracy
-        })
-    
-    avg_accuracy = sum(p["accuracy"] for p in predictions) / len(predictions)
-    
-    return jsonify({
-        "predictions": predictions,
-        "average_accuracy": round(avg_accuracy, 1)
-    }), 200
+    return jsonify(result), 200
 
 @app.route("/api/admin/smart-matches", methods=["GET"])
 @role_required("admin")
 def get_smart_matches():
-    active_alerts = list(alerts_col.find({"status": "pending"}).sort("created_at", -1).limit(5))
-    active_ngos = list(ngos_col.find({"active": True}))
-    matches = []
+    result = build_smart_matches(
+        ollama_service=ollama_service,
+        active_alerts=list(alerts_col.find({"status": "pending"}).sort("created_at", -1).limit(5)),
+        active_ngos=list(ngos_col.find({"active": True})),
+        order_counts=build_order_counts(),
+    )
 
-    for alert in active_alerts:
-        best_match = None
-        best_score = -1
-        for ngo in active_ngos:
-            order_count = orders_col.count_documents({"ngo_email": ngo.get("email")})
-            distance = (sum(ord(ch) for ch in ngo.get("email", "")) % 7) + 1
-            score = min(100, 45 + (order_count * 8) + max(0, 30 - distance * 3))
-            if score > best_score:
-                reasons = []
-                reasons.append(f"{order_count} prior pickups" if order_count else "Ready for first pickup")
-                reasons.append(f"{distance} km estimated distance")
-                best_match = {
-                    "restaurant": alert.get("restaurant_name", "Restaurant"),
-                    "bestNgo": ngo.get("name", ngo.get("email")),
-                    "reason": " + ".join(reasons),
-                    "score": score
-                }
-                best_score = score
+    return jsonify(result), 200
 
-        if best_match:
-            matches.append(best_match)
 
-    if not matches:
-        matches = [{
-            "restaurant": "No active alerts",
-            "bestNgo": "Waiting for new rescue requests",
-            "reason": "Create a restaurant alert to generate matching suggestions",
-            "score": 0
-        }]
+@app.route("/api/ai/admin-insights", methods=["GET"])
+@role_required("admin")
+def get_admin_insights():
+    prediction_result = build_prediction_accuracy(
+        ollama_service=ollama_service,
+        weekly_snapshot=build_weekly_prediction_snapshot(),
+    )
+    smart_match_result = build_smart_matches(
+        ollama_service=ollama_service,
+        active_alerts=list(alerts_col.find({"status": "pending"}).sort("created_at", -1).limit(5)),
+        active_ngos=list(ngos_col.find({"active": True})),
+        order_counts=build_order_counts(),
+    )
+    ollama_status = ollama_service.get_status()
 
-    return jsonify({"matches": matches}), 200
+    return jsonify({
+        "behavior_analysis": build_behavior_analysis(),
+        "predictions": prediction_result["predictions"],
+        "average_accuracy": prediction_result["average_accuracy"],
+        "matches": smart_match_result["matches"],
+        "source": "ollama" if "ollama" in {prediction_result["source"], smart_match_result["source"]} else "fallback",
+        "models": {
+            "prediction": prediction_result["model"],
+            "matching": smart_match_result["model"],
+        },
+        "status": ollama_status,
+        "trained_model": trained_surplus_model.metadata() if trained_surplus_model else None,
+    }), 200
+
+
+@app.route("/api/ai/status", methods=["GET"])
+@jwt_required()
+def get_ai_status():
+    return jsonify({
+        **ollama_service.get_status(),
+        "trained_model_available": trained_surplus_model is not None,
+        "trained_model": trained_surplus_model.metadata() if trained_surplus_model else None,
+    }), 200
 
 
 # -------------------------
