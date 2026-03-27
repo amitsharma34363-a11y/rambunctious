@@ -281,6 +281,56 @@ function sumRows(rows, field) {
   return rows.reduce((total, row) => total + safeNumber(row[field]), 0);
 }
 
+function normalizeListId(value, fallback) {
+  const text = `${value ?? ""}`.trim();
+  return text || fallback;
+}
+
+function dedupeBy(items, getKey) {
+  const seen = new Set();
+  return items.filter((item, index) => {
+    const key = getKey(item, index);
+    if (seen.has(key)) {
+      return false;
+    }
+    seen.add(key);
+    return true;
+  });
+}
+
+function mergeAlertCategories(entries) {
+  const merged = new Map();
+
+  entries.forEach((entry, index) => {
+    const name = normalizeListId(entry.name || entry.category, `Category ${index + 1}`);
+    const available = safeNumber(entry.available ?? entry.remaining);
+    const foodType = normalizeListId(entry.food_type || entry.foodType, "Both");
+    const key = name.toLowerCase();
+    const current = merged.get(key);
+
+    if (current) {
+      current.available += available;
+      if (current.foodType !== foodType) {
+        current.foodType = "Mixed";
+      }
+      return;
+    }
+
+    merged.set(key, {
+      id: key,
+      name,
+      available,
+      foodType,
+    });
+  });
+
+  return Array.from(merged.values()).filter((entry) => entry.available > 0);
+}
+
+function normalizeUserListKey(entry, index = 0) {
+  return normalizeListId(entry?._id ?? entry?.email, `user-${index}`);
+}
+
 function normalizePlanName(plan) {
   return (plan.name || "Plan").replace(/[^\w\s]/g, "").trim() || "Plan";
 }
@@ -542,7 +592,7 @@ function LandingPage({ onSignIn, onGetStarted, onDemo }) {
         </section>
       </main>
 
-      <footer className="landing-footer">© 2024 LastMile Rescue. Built to reduce food waste.</footer>
+      <footer className="landing-footer">Copyright 2024 LastMile Rescue. Built to reduce food waste.</footer>
     </div>
   );
 }
@@ -1184,20 +1234,23 @@ function SegmentedControl({ options, value, onChange }) {
 
 function normalizeAlert(alert) {
   const providerType = alert.provider_type || alert.providerType || "restaurant";
-  const categories = (alert.categories?.length ? alert.categories : [
-    {
-      name: alert.category || "Mixed",
-      available: safeNumber(alert.surplus_meals),
-      food_type: alert.food_type || "Both",
-    },
-  ]).map((entry) => ({
-    name: entry.name,
-    available: safeNumber(entry.available),
-    foodType: entry.food_type || "Both",
-  }));
+  const categories = mergeAlertCategories(
+    alert.categories?.length
+      ? alert.categories
+      : [
+          {
+            name: alert.category || "Mixed",
+            available: safeNumber(alert.surplus_meals),
+            food_type: alert.food_type || "Both",
+          },
+        ]
+  );
 
   return {
-    id: alert._id,
+    id: normalizeListId(
+      alert._id ?? alert.id,
+      `alert-${providerType}-${alert.restaurant_email || alert.provider_email || "unknown"}`
+    ),
     name: alert.provider_name || alert.restaurant_name || getRoleLabel(providerType),
     providerType,
     providerLabel: alert.provider_label || getRoleLabel(providerType),
@@ -1220,7 +1273,10 @@ function normalizeOrder(order) {
   const items = order.items || [];
   const providerType = order.provider_type || "restaurant";
   return {
-    id: order._id,
+    id: normalizeListId(
+      order._id ?? order.id,
+      `order-${order.alert_id || order.provider_email || "unknown"}`
+    ),
     restaurantName: order.provider_name || order.restaurant_name || getRoleLabel(providerType),
     providerType,
     providerLabel: order.provider_label || getRoleLabel(providerType),
@@ -1230,7 +1286,7 @@ function normalizeOrder(order) {
     pickupTime: order.pickup_time || "21:30",
     createdAt: order.created_at,
     summary: items.length
-      ? items.map((entry) => `${entry.category} ×${entry.quantity}`).join(", ")
+      ? items.map((entry) => `${entry.category} x${entry.quantity}`).join(", ")
       : "No item breakdown available",
   };
 }
@@ -2015,8 +2071,8 @@ function NGOWorkspace({ user, token, onLogout }) {
         const data = await apiRequest("/ngo/dashboard", { token });
         if (ignore) return;
         setNgo(data.ngo || null);
-        setAlerts((data.alerts || []).map(normalizeAlert));
-        setOrders((data.orders || []).map(normalizeOrder));
+        setAlerts(dedupeBy((data.alerts || []).map(normalizeAlert), (entry) => entry.id));
+        setOrders(dedupeBy((data.orders || []).map(normalizeOrder), (entry) => entry.id));
       } catch (dashboardError) {
         if (!ignore) {
           setNotice({
@@ -2041,8 +2097,8 @@ function NGOWorkspace({ user, token, onLogout }) {
   const refreshDashboard = async () => {
     const data = await apiRequest("/ngo/dashboard", { token });
     setNgo(data.ngo || null);
-    setAlerts((data.alerts || []).map(normalizeAlert));
-    setOrders((data.orders || []).map(normalizeOrder));
+    setAlerts(dedupeBy((data.alerts || []).map(normalizeAlert), (entry) => entry.id));
+    setOrders(dedupeBy((data.orders || []).map(normalizeOrder), (entry) => entry.id));
   };
 
   const handleToggleAlert = (alertId) => {
@@ -2050,19 +2106,19 @@ function NGOWorkspace({ user, token, onLogout }) {
     setCart((current) => current);
   };
 
-  const handleQuantityChange = (alert, categoryName, delta) => {
-    const category = alert.categories.find((item) => item.name === categoryName);
+  const handleQuantityChange = (alert, categoryId, delta) => {
+    const category = alert.categories.find((item) => item.id === categoryId);
     if (!category) return;
 
     setCart((current) => {
       const alertCart = current[alert.id] || {};
-      const currentValue = safeNumber(alertCart[categoryName]);
+      const currentValue = safeNumber(alertCart[categoryId]);
       const nextValue = Math.max(0, Math.min(category.available, currentValue + delta));
       return {
         ...current,
         [alert.id]: {
           ...alertCart,
-          [categoryName]: nextValue,
+          [categoryId]: nextValue,
         },
       };
     });
@@ -2076,7 +2132,11 @@ function NGOWorkspace({ user, token, onLogout }) {
   );
 
   const placeOrder = async (alert) => {
-    const selectedItems = cart[alert.id] || {};
+    const selectedItems = Object.fromEntries(
+      alert.categories
+        .map((category) => [category.name, safeNumber(cart[alert.id]?.[category.id])])
+        .filter(([, quantity]) => quantity > 0)
+    );
     const selectedCount = getSelectedCount(alert.id);
 
     if (!selectedCount) {
@@ -2106,7 +2166,9 @@ function NGOWorkspace({ user, token, onLogout }) {
         }),
       });
 
-      setOrders((current) => [normalizeOrder(response.order), ...current]);
+      setOrders((current) =>
+        dedupeBy([normalizeOrder(response.order), ...current], (entry) => entry.id)
+      );
       if (response.alert && safeNumber(response.alert.surplus_meals) > 0) {
         setAlerts((current) =>
           current.map((currentAlert) =>
@@ -2269,9 +2331,9 @@ function NGOWorkspace({ user, token, onLogout }) {
                               <div className="pill pill--soft">Recurring alerts enabled</div>
                             )}
                             {alert.categories.map((category) => {
-                              const quantity = safeNumber(cart[alert.id]?.[category.name]);
+                              const quantity = safeNumber(cart[alert.id]?.[category.id]);
                               return (
-                                <div key={category.name} className="portion-row">
+                                <div key={category.id} className="portion-row">
                                   <div>
                                     <h3>{category.name}</h3>
                                     <p>{category.available} available</p>
@@ -2280,15 +2342,15 @@ function NGOWorkspace({ user, token, onLogout }) {
                                     <button
                                       type="button"
                                       className="stepper__button"
-                                      onClick={() => handleQuantityChange(alert, category.name, -1)}
+                                      onClick={() => handleQuantityChange(alert, category.id, -1)}
                                     >
-                                      −
+                                      -
                                     </button>
                                     <strong>{quantity}</strong>
                                     <button
                                       type="button"
                                       className="stepper__button"
-                                      onClick={() => handleQuantityChange(alert, category.name, 1)}
+                                      onClick={() => handleQuantityChange(alert, category.id, 1)}
                                     >
                                       +
                                     </button>
@@ -2342,7 +2404,7 @@ function NGOWorkspace({ user, token, onLogout }) {
                           <div>
                             <h3>{order.restaurantName}</h3>
                             <p>
-                              {order.providerLabel} • {order.summary}
+                              {order.providerLabel} | {order.summary}
                             </p>
                           </div>
                           <div className="order-card__meta">
@@ -2425,7 +2487,7 @@ function AdminWorkspace({ user, token, onLogout }) {
         if (ignore) return;
 
         setStats(dashboard.stats || null);
-        setUsers(usersResponse.users || []);
+        setUsers(dedupeBy(usersResponse.users || [], normalizeUserListKey));
         setBehaviorAnalysis(insights.behavior_analysis || []);
         setPredictionAccuracy(insights.predictions || []);
         setSmartMatches(insights.matches || []);
@@ -2463,7 +2525,7 @@ function AdminWorkspace({ user, token, onLogout }) {
     ]);
 
     setStats(dashboard.stats || null);
-    setUsers(usersResponse.users || []);
+    setUsers(dedupeBy(usersResponse.users || [], normalizeUserListKey));
     setBehaviorAnalysis(insights.behavior_analysis || []);
     setPredictionAccuracy(insights.predictions || []);
     setSmartMatches(insights.matches || []);
@@ -2663,7 +2725,7 @@ function AdminWorkspace({ user, token, onLogout }) {
                         <div>
                           <strong>{segment.label}</strong>
                           <span>
-                            {segment.value} portions • {segment.percent}%
+                            {segment.value} portions | {segment.percent}%
                           </span>
                         </div>
                       </div>
@@ -2813,8 +2875,8 @@ function AdminWorkspace({ user, token, onLogout }) {
                 )}
 
                 <div className="user-list">
-                  {users.map((entry) => (
-                    <article key={entry._id || entry.email} className="user-row">
+                  {users.map((entry, index) => (
+                    <article key={normalizeUserListKey(entry, index)} className="user-row">
                       <div className="user-row__identity">
                         <div className="entity-badge entity-badge--soft">{getInitials(entry.name)}</div>
                         <div>
@@ -2938,7 +3000,7 @@ function AdminWorkspace({ user, token, onLogout }) {
                       <article key={`${match.restaurant}-${index}`} className="match-card">
                         <div className="match-card__header">
                           <strong>
-                            {match.restaurant} → {match.bestNgo}
+                            {match.restaurant} {"->"} {match.bestNgo}
                           </strong>
                           <span className="pill pill--success">{safeNumber(match.score)}% match</span>
                         </div>

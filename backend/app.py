@@ -7,7 +7,7 @@ from twilio.rest import Client
 from twilio.twiml.messaging_response import MessagingResponse
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from functools import wraps
 import os
 import sys
@@ -35,6 +35,9 @@ except Exception:
 app = Flask(__name__)
 CORS(app)
 
+def utc_now():
+    return datetime.now(timezone.utc).replace(tzinfo=None)
+
 # MongoDB Connection (Optional - will use mock data if not available)
 MOCK_MODE = True  # Set to False when MongoDB is running
 db = None
@@ -58,9 +61,9 @@ try:
     orders_col = db["orders"]
     subscriptions_col = db["subscriptions"]
     MOCK_MODE = False
-    print("✅ MongoDB connected")
+    print("MongoDB connected")
 except Exception as e:
-    print(f"⚠️ MongoDB not available, using mock mode: {e}")
+    print(f"MongoDB not available, using mock mode: {e}")
     MOCK_MODE = True
     db = None
     users_col = None
@@ -256,7 +259,7 @@ class MockCollection:
         import uuid
         item['_id'] = str(uuid.uuid4())
         if 'created_at' not in item:
-            item['created_at'] = datetime.utcnow()
+            item['created_at'] = utc_now()
         self.data.append(item)
         return type('obj', (object,), {'inserted_id': item['_id']})
     
@@ -634,7 +637,7 @@ def apply_collected_order_to_food_data(order, alert=None):
         {"$set": {
             "remaining_food": updated_remaining,
             "donated_food": updated_donated,
-            "last_collection_at": datetime.utcnow()
+            "last_collection_at": utc_now()
         }}
     )
     return food_data_col.find_one({"_id": food_entry["_id"]})
@@ -994,7 +997,7 @@ def login():
                 "subscription": demo_user.get("subscription", "free"),
                 "location": demo_user.get("location", "Demo Location"),
                 "phone": demo_user.get("phone", ""),
-                "createdAt": datetime.utcnow(),
+                "createdAt": utc_now(),
                 "loginHistory": []
             }
             if is_provider_role(role):
@@ -1107,7 +1110,7 @@ def register():
         "location": location,
         "phone": phone,
         "subscription": "free",
-        "createdAt": datetime.utcnow(),
+        "createdAt": utc_now(),
         "loginHistory": []
     }
     if is_provider_role(role):
@@ -1181,7 +1184,7 @@ def submit_food_data():
         "provider_type": provider_type,
         "provider_label": provider.get("provider_label", get_provider_label(provider_type)),
         "date": datetime.now().date(),
-        "timestamp": datetime.utcnow(),
+        "timestamp": utc_now(),
         "food_prepared": food_prepared,
         "food_sold": food_sold,
         "remaining_food": remaining_food,
@@ -1325,8 +1328,8 @@ def send_rescue_alert():
             restaurant.get("recurring_alerts", False),
         ),
         "status": "pending",
-        "created_at": datetime.utcnow(),
-        "expires_at": datetime.utcnow() + timedelta(hours=2)
+        "created_at": utc_now(),
+        "expires_at": utc_now() + timedelta(hours=2)
     }
     
     alerts_col.insert_one(alert)
@@ -1458,7 +1461,7 @@ def accept_alert(alert_id):
         {"$set": {
             "status": next_status,
             "accepted_by": current_user,
-            "accepted_at": datetime.utcnow(),
+            "accepted_at": utc_now(),
             "reserved_portions": int(alert.get("reserved_portions", 0) or 0) + total_portions,
             "surplus_meals": remaining_portions,
             "categories": updated_categories
@@ -1483,7 +1486,7 @@ def accept_alert(alert_id):
         "payment_method": data.get("payment_method", "free"),
         "notes": data.get("notes", ""),
         "status": "Accepted",
-        "created_at": datetime.utcnow()
+        "created_at": utc_now()
     }
     inserted_order = orders_col.insert_one(order)
     updated_alert = alerts_col.find_one({"_id": alert_id}) or {
@@ -1530,17 +1533,17 @@ def mark_collected(alert_id):
         {"_id": alert_id},
         {"$set": {
             "status": "collected",
-            "collected_at": datetime.utcnow()
+            "collected_at": utc_now()
         }}
     )
     orders_col.update_one(
         {"alert_id": alert_id},
         {"$set": {
             "status": "Collected",
-            "collected_at": datetime.utcnow()
+            "collected_at": utc_now()
         }}
     )
-    return jsonify({"message": "Marked as collected! Thank you! 🎉"}), 200
+    return jsonify({"message": "Marked as collected! Thank you!"}), 200
 
 
 @app.route("/api/ngo/mark-order-collected/<order_id>", methods=["POST"])
@@ -1561,7 +1564,7 @@ def mark_order_collected(order_id):
         {"_id": order_id},
         {"$set": {
             "status": "Collected",
-            "collected_at": datetime.utcnow()
+            "collected_at": utc_now()
         }}
     )
     updated_order = orders_col.find_one({"_id": order_id}) or {**order, "status": "Collected"}
@@ -1578,7 +1581,7 @@ def mark_order_collected(order_id):
                 {"_id": alert_id},
                 {"$set": {
                     "status": "collected",
-                    "collected_at": datetime.utcnow()
+                    "collected_at": utc_now()
                 }}
             )
 
@@ -1673,7 +1676,7 @@ def add_restaurant():
         "location": data.get("location", "Unknown"),
         "phone": data.get("phone", ""),
         "subscription": "free",
-        "created_at": datetime.utcnow()
+        "created_at": utc_now()
     }
     provider_profile = build_provider_profile(email, user=user, payload=data)
     user.update({
@@ -1722,7 +1725,7 @@ def add_ngo():
         "location": data.get("location", "Unknown"),
         "phone": data.get("phone", ""),
         "subscription": "free",
-        "created_at": datetime.utcnow()
+        "created_at": utc_now()
     }
     users_col.insert_one(user)
     
@@ -1897,7 +1900,7 @@ def predict_surplus():
     return jsonify({
         "predicted_surplus": result["predicted_surplus"],
         "confidence": result["confidence"],
-        "message": f"🤖 AI predicts ~{prediction} meals surplus tomorrow",
+        "message": f"AI predicts ~{prediction} meals surplus tomorrow",
         "message": result["message"],
         "suggestions": result["suggestions"],
         "source": result["source"],
